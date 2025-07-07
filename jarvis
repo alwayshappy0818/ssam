@@ -1,46 +1,41 @@
-print("--- Jarvis Final Edition (Service Account Auth) ---")
+print("--- Jarvis Final Edition (Gemini Core) Booting up... ---")
 
 import json, subprocess, platform, requests, pyautogui, os, asyncio
 from datetime import datetime
 import edge_tts
 import pygame
 import google.generativeai as genai
-from google.oauth2 import service_account # 서비스 계정 인증을 위해 추가
 
-# --- 1. 서비스 계정 및 엔진 설정 ---
+# --- 1. API 및 음성 엔진 설정 ---
 try:
-    # 2단계에서 프로젝트 폴더에 넣은 서비스 계정 키 파일의 이름을 지정합니다.
-    SERVICE_ACCOUNT_FILE = 'service_account.json'
+    # 1단계에서 발급받은 Gemini API 키를 붙여넣으세요.
+    GEMINI_API_KEY = "여기에_발급받은_Gemini_API_키를_붙여넣으세요"
+    genai.configure(api_key=GEMINI_API_KEY)
     
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    key_path = os.path.join(script_dir, SERVICE_ACCOUNT_FILE)
-
-    # 서비스 계정 파일로부터 인증 정보를 생성합니다.
-    credentials = service_account.Credentials.from_service_account_file(key_path)
-    # API 키 대신 생성된 인증 정보로 Gemini를 설정합니다.
-    genai.configure(credentials=credentials)
-    
+    # 사용할 Gemini 모델 설정
     gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
     
+    # edge-tts 음성 설정
     VOICE = "ko-KR-SunHiNeural"
     RATE = "+20%"
     pygame.mixer.init()
 
 except Exception as e:
-    print(f"엔진 초기화 실패: {e}\n서비스 계정 파일의 경로와 이름이 올바른지 확인하세요.")
+    print(f"엔진 초기화 실패: {e}\nAPI 키 또는 라이브러리 설치를 확인하세요.")
     exit()
 
 # --- 2. 설정 파일 로드 ---
 try:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     json_path = os.path.join(script_dir, 'commands.json')
     with open(json_path, encoding="utf-8") as f:
         full_config = json.load(f)
     COMMANDS = {k: v for k, v in full_config.items() if not k.startswith("##")}
 except FileNotFoundError:
-    speak(f"오류. '{json_path}' 에서 commands.json을 찾을 수 없습니다.")
+    # speak 함수가 초기화되기 전이므로 print 사용
+    print(f"오류: '{json_path}' 에서 commands.json을 찾을 수 없습니다.")
     exit()
 
-# (이하 3단계, 4단계 코드는 이전과 모두 동일합니다.)
 # --- 3. 핵심 기능 함수 ---
 def speak(text):
     print(f"🔊 자비스: {text}")
@@ -94,47 +89,51 @@ def get_response_text(command_info):
 def execute(action_key):
     command_info = COMMANDS.get(action_key, {})
     cmd = command_info.get(platform.system().lower())
-    action_type = command_info.get("action_type")
     if cmd:
         try:
-            if action_type == 'execute':
-                subprocess.Popen(cmd, shell=True)
-            else:
-                subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+            subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
             return get_response_text(command_info)
-        except Exception as e:
-            print(f"'{action_key}' 실행 중 오류 발생: {e}")
-            return f"{command_info.get('target_name', action_key)} 실행 중 오류가 발생했습니다."
+        except: return f"{command_info.get('target_name', action_key)} 실행 중 오류가 발생했습니다."
     return "실행할 명령어가 없습니다."
 
 def ask_gemini(prompt):
+    """Gemini API에 프롬프트를 보내고 응답을 받는 함수"""
     try:
         response = gemini_model.generate_content(prompt)
         return response.text.strip().strip("'\".,")
     except Exception as e:
         print(f"오류: Gemini API와 통신 중 문제가 발생했습니다. ({e})")
-        return "죄송합니다, 지금은 답변할 수 없습니다."
+        return "죄송합니다, 지금은 답변할 수 없습니다. API 연결에 문제가 있는 것 같습니다."
 
 # --- 4. 메인 루프 ---
-speak("자비스 온라인, 어떻게 도와드릴까요?")
+speak("자비스 온라인.")
 while True:
     text = input("⌨️ 명령을 입력하세요: ")
     if not text.strip(): continue
     command_raw = text.replace("자비스", "").strip() if "자비스" in text else text.strip()
+
     if command_raw.lower() in ['종료', 'exit', 'quit']:
-        speak("자비스를 종료합니다. 오늘도 좋은 하루 되세요!")
+        speak("자비스를 종료합니다.")
         break
+    
     print(f"💬 인식된 명령: {command_raw}")
+
+    # --- 모든 판단을 Gemini에게 맡깁니다. ---
     final_command_key = None
     available_functions = list(COMMANDS.keys())
+    
     function_descriptions = []
     for key, info in COMMANDS.items():
         description = f"- '{key}' (관련 표현: {', '.join(info.get('aliases', []))})"
         function_descriptions.append(description)
-    intent_prompt = (f"당신은 사용자의 자연어 명령에서 핵심 의도를 파악하는 AI 두뇌입니다. 다음 '기능 설명'을 참고하여, 주어진 '사용자 명령'과 가장 일치하는 기능의 이름(key) '하나'만 정확히 출력해주세요.\n\n## 기능 설명:\n" + "\n".join(function_descriptions) + f"\n\n## 지시:\n적합한 기능이 있다면 그 기능의 이름만, 없다면 'NULL'만 출력하세요.\n\n## 사용자 명령:\n\"{command_raw}\"")
+    
+    intent_prompt = (f"당신은 사용자의 자연어 명령에서 핵심 의도를 파악하는 AI 두뇌입니다. 아래 '기능 설명'을 참고하여, 주어진 '사용자 명령'과 가장 일치하는 기능의 이름(key) '하나'만 정확히 출력해주세요.\n\n## 기능 설명:\n" + "\n".join(function_descriptions) + f"\n\n## 지시:\n적합한 기능이 있다면 그 기능의 이름만, 없다면 'NULL'만 출력하세요.\n\n## 사용자 명령:\n\"{command_raw}\"")
+    
     gemini_suggestion = ask_gemini(intent_prompt)
+    
     if gemini_suggestion != "NULL" and gemini_suggestion in available_functions:
         final_command_key = gemini_suggestion
+    
     result = ""
     if final_command_key:
         command_info = COMMANDS.get(final_command_key, {})
@@ -153,7 +152,8 @@ while True:
         else:
             result = execute(final_command_key)
     else:
-        chat_prompt = f"당신은 '자비스'라는 이름을 가진 AI 비서입니다. 사용자의 다음 말에 대해 자연스럽게 대화하듯 답변해주세요.자연스러운 대화에서 답변이 너무 길지않게 최대한 짧고 간결하게 하세요.\n\n사용자: \"{command_raw}\"\n자비스:"
+        chat_prompt = f"당신은 '자비스'라는 이름을 가진 AI 비서입니다. 사용자의 다음 말에 대해 자연스럽게 대화하듯 답변해주세요.\n\n사용자: \"{command_raw}\"\n자비스:"
         result = ask_gemini(chat_prompt) or f"'{command_raw}'에 해당하는 명령을 찾지 못했습니다."
+
     if result:
         speak(result)
