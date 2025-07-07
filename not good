@@ -1,0 +1,161 @@
+print("--- Jarvis v31 (Rule-Based Priority) Booting up... ---")
+
+import json, subprocess, platform, requests, pyautogui, os, asyncio
+from datetime import datetime
+import edge_tts
+import pygame
+
+# --- 1. 음성 엔진 및 키워드 설정 ---
+VOICE = "ko-KR-SunHiNeural"
+RATE = "+20%"
+pygame.mixer.init()
+
+# 행동 키워드 정의
+ACTION_KEYWORDS = {
+    "execute": ["켜줘", "실행", "열어", "열기", "틀어줘", "보여줘", "켜봐"],
+    "terminate": ["꺼줘", "종료", "닫아", "닫기", "그만"],
+    "fetch_and_report": ["알려줘", "어때", "몇 시", "확인"],
+    "empty": ["비워줘", "비우기", "삭제"]
+}
+
+# --- 2. 설정 파일 로드 ---
+try:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    json_path = os.path.join(script_dir, 'commands.json')
+    with open(json_path, encoding="utf-8") as f:
+        full_config = json.load(f)
+    COMMANDS = {k: v for k, v in full_config.items() if not k.startswith("##")}
+except FileNotFoundError:
+    print(f"오류: '{json_path}' 에서 commands.json을 찾을 수 없습니다.")
+    exit()
+
+# --- 3. 핵심 기능 함수 ---
+def speak(text):
+    print(f"🔊 자비스: {text}")
+    try: asyncio.run(_speak_async(text))
+    except Exception as e: print(f"음성 출력 중 오류 발생: {e}")
+
+async def _speak_async(text):
+    output_file = "response.mp3"
+    try:
+        communicate = edge_tts.Communicate(text, VOICE, rate=RATE)
+        await communicate.save(output_file)
+        pygame.mixer.music.load(output_file)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy(): pygame.time.Clock().tick(10)
+        pygame.mixer.music.unload(); await asyncio.sleep(0.1); os.remove(output_file)
+    except Exception as e: print(f"비동기 음성 처리 중 오류: {e}")
+
+def get_current_time():
+    now = datetime.now()
+    am_pm = "오후" if now.hour >= 12 else "오전"
+    hour = now.hour - 12 if now.hour > 12 else (12 if now.hour == 0 else now.hour)
+    return f"현재 시간은 {am_pm} {hour}시 {now.minute}분입니다."
+
+def get_weather_forecast():
+    try:
+        lat, lon = 36.7836, 127.0000
+        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,wind_speed_10m"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        temp = data['current']['temperature_2m']
+        wind_speed_kmh = round(data['current']['wind_speed_10m'] * 3.6, 1)
+        return f"현재 아산시의 기온은 {temp}도, 풍속은 시속 {wind_speed_kmh} 킬로미터입니다."
+    except: return "날씨 정보를 가져오는 데 실패했습니다."
+
+def get_response_text(command_info):
+    target = command_info.get('target_name', '')
+    action_type = command_info.get('action_type', '')
+    def has_batchim(word):
+        if not word: return False
+        last_char = word[-1]
+        if '가' <= last_char <= '힣': return (ord(last_char) - ord('가')) % 28 > 0
+        return False
+    target_eul_reul = target + '을' if has_batchim(target) else target + '를'
+    if action_type == 'execute': return f"알겠습니다. {target_eul_reul} 실행하겠습니다."
+    elif action_type == 'terminate': return f"네. {target_eul_reul} 종료하겠습니다."
+    elif action_type == 'empty': return f"{target_eul_reul} 비우겠습니다."
+    elif action_type == 'special' and target == '스크린샷': return "스크린샷을 실행합니다."
+    return f"{target} 명령을 실행합니다."
+
+def execute(action_key):
+    command_info = COMMANDS.get(action_key, {})
+    cmd = command_info.get(platform.system().lower())
+    action_type = command_info.get("action_type")
+    if cmd:
+        try:
+            if action_type == 'execute':
+                subprocess.Popen(cmd, shell=True)
+            else:
+                subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+            return get_response_text(command_info)
+        except Exception as e:
+            print(f"'{action_key}' 실행 중 오류 발생: {e}")
+            return f"{command_info.get('target_name', action_key)} 실행 중 오류가 발생했습니다."
+    return "실행할 명령어가 없습니다."
+    
+def ask_ollama(prompt):
+    try:
+        response = requests.post("http://localhost:11434/api/generate", json={"model": "mistral", "prompt": prompt, "stream": False}, timeout=30)
+        response.raise_for_status()
+        return response.json().get("response", "").strip()
+    except Exception as e:
+        print(f"오류: Ollama와 통신 중 문제가 발생했습니다. ({e})")
+        return ""
+
+# --- 4. 메인 루프 ---
+speak("자비스 온라인.")
+while True:
+    text = input("⌨️ 명령을 입력하세요: ")
+    if not text.strip(): continue
+    command_raw = text.replace("자비스", "").strip() if "자비스" in text else text.strip()
+
+    if command_raw.lower() in ['종료', 'exit', 'quit']:
+        speak("자비스를 종료합니다.")
+        break
+    
+    print(f"💬 인식된 명령: {command_raw}")
+
+    final_command_key = None
+    
+    detected_action = None
+    for action, keywords in ACTION_KEYWORDS.items():
+        if any(keyword in command_raw for keyword in keywords):
+            detected_action = action
+            break
+            
+    if detected_action:
+        longest_alias_len = 0
+        relevant_commands = {k: v for k, v in COMMANDS.items() if v.get("action_type") == detected_action}
+        
+        for key, info in relevant_commands.items():
+            for alias in info.get("aliases", []):
+                if alias in command_raw and len(alias) > longest_alias_len:
+                    longest_alias_len = len(alias)
+                    final_command_key = key
+    
+    result = ""
+    if final_command_key:
+        command_info = COMMANDS.get(final_command_key, {})
+        action_type = command_info.get('action_type')
+
+        if action_type == 'fetch_and_report':
+            target_name = command_info.get('target_name')
+            if target_name == '현재 날씨': result = get_weather_forecast()
+            elif target_name == '현재 시간': result = get_current_time()
+        elif action_type == 'special':
+            result = get_response_text(command_info)
+            pyautogui.hotkey('win', 'shift', 's')
+        elif action_type == 'empty':
+            speak(f"경고, {command_info.get('target_name')}을(를) 비우면 되돌릴 수 없습니다. 정말 실행하시겠습니까?")
+            confirm = input("정말 실행하시겠습니까? (y/n): ")
+            result = execute(final_command_key) if confirm.lower() == 'y' else "실행이 취소되었습니다."
+        else:
+            result = execute(final_command_key)
+    else:
+        chat_prompt = f"당신은 '자비스'라는 이름을 가진 AI 비서입니다. 사용자의 다음 말에 대해 자연스럽게 대화하듯 답변해주세요.\n\n사용자: \"{command_raw}\"\n자비스:"
+        result = ask_ollama(chat_prompt) or f"'{command_raw}'에 해당하는 명령을 찾지 못했습니다."
+
+    if result:
+        speak(result)
