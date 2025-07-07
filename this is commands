@@ -1,0 +1,176 @@
+{
+    "## 프로그램 실행 ##": {},
+    "메모장 실행": {
+        "target_name": "메모장",
+        "action_type": "execute",
+        "aliases": ["메모장 켜줘", "메모장 열기", "노트패드"],
+        "windows": "notepad.exe"
+    },
+    "카카오톡 실행": {
+        "target_name": "카카오톡",
+        "action_type": "execute",
+        "aliases": ["카톡", "카톡 켜줘", "카카오톡 좀"],
+        "windows": "start \"\" \"%ProgramFiles(x86)%\\Kakao\\KakaoTalk\\KakaoTalk.exe\""
+    },
+    "크롬 실행": {
+        "target_name": "크롬",
+        "action_type": "execute",
+        "aliases": ["크롬 켜줘", "인터넷", "구글"],
+        "windows": "start chrome"
+    },
+    "리그 오브 레전드 실행": {
+        "target_name": "리그 오브 레전드",
+        "action_type": "execute",
+        "aliases": ["롤", "롤 켜줘", "롤 한판", "롤 좀"],
+        "windows": "start \"\" \"C:\\Riot Games\\Riot Client\\RiotClientServices.exe\""
+    },
+    "LTspice 실행": {
+        "target_name": "LTspice",
+        "action_type": "execute",
+        "aliases": ["LT스파이스", "LTspice 켜줘", "LTspice좀 켜줄래"],
+        "windows": "\"C:\\Users\\김준오\\AppData\\Local\\Programs\\ADI\\LTspice\\LTspice.exe\""
+    },
+    "유튜브 실행": {
+        "target_name": "유튜브",
+        "action_type": "execute",
+        "aliases": ["유튜브", "유튜브 켜줘", "youtube"],
+        "windows": "start https://www.youtube.com"
+    },
+    "파파고 실행": {
+        "target_name": "파파고",
+        "action_type": "execute",
+        "aliases": ["파파고", "파파고 번역기", "papago"],
+        "windows": "start https://papago.naver.com"
+    },
+    "구글 지도 실행": {
+        "target_name": "구글 지도",
+        "action_type": "execute",
+        "aliases": ["구글맵", "지도 켜줘", "길찾기"],
+        "windows": "start https://www.google.com/maps"
+    },
+    "호서대학교 포털 실행": {
+        "target_name": "호서대학교 포털",
+        "action_type": "execute",
+        "aliases": ["호서대 포털", "호서대 사이트", "학교 포털"],
+        "windows": "start \"\" \"https://sso.hoseo.edu/svc/tk/Auth.do?id=NEW_PORTAL&ac=Y&ifa=N&\""
+    },
+    "계산기 실행": {
+        "target_name": "계산기",
+        "action_type": "execute",
+        "aliases": ["계산기 켜줘", "계산기 좀"],
+        "windows": "calc.exe"
+    },
+    "파일 탐색기 실행": {
+        "target_name": "파일 탐색기",
+        "action_type": "execute",
+        "aliases": ["탐색기", "내 컴퓨터", "파일 열기"],
+        "windows": "explorer.exe"
+    },
+    "작업 관리자 실행": {
+        "target_name": "작업 관리자",
+        "action_type": "execute",
+        "aliases": ["작업 관리자 켜줘", "프로세스 보기"],
+        "windows": "taskmgr.exe"
+    },
+    "Spotify 실행": {
+        "target_name": "스포티파이",
+        "action_type": "execute",
+        "aliases": ["스포티파이 켜줘", "노래 틀어줘", "spotify"],
+        "windows": "start spotify:"
+    },
+    "Discord 실행": {
+        "target_name": "디스코드",
+        "action_type": "execute",
+        "aliases": ["디코", "디코 켜줘", "discord"],
+        "windows": "start \"\" \"%LocalAppData%\\Discord\\Update.exe\" --processStart Discord.exe"
+    },
+    "Word 실행": {
+        "target_name": "Microsoft Word",
+        "action_type": "execute",
+        "aliases": ["워드", "워드 켜줘", "MS워드"],
+        "windows": "start winword"
+    },
+    "Excel 실행": {
+        "target_name": "Microsoft Excel",
+        "action_type": "execute",
+        "aliases": ["엑셀", "엑셀 켜줘", "MS엑셀"],
+        "windows": "start excel"
+    },
+    "PowerPoint 실행": {
+        "target_name": "Microsoft PowerPoint",
+        "action_type": "execute",
+        "aliases": ["파워포인트", "PPT", "피피티"],
+        "windows": "start powerpnt"
+    },
+
+    "## 프로그램 종료 ##": {},
+    "메모장 종료": { "target_name": "메모장", "action_type": "terminate", "aliases": ["메모장 꺼줘", "메모장 닫아"], "windows": "taskkill /F /IM notepad.exe" },
+    "카카오톡 종료": { "target_name": "카카오톡", "action_type": "terminate", "aliases": ["카톡 꺼줘", "카톡 종료해"], "windows": "taskkill /F /IM KakaoTalk.exe" },
+    "크롬 종료": { "target_name": "크롬", "action_type": "terminate", "aliases": ["크롬 꺼줘", "인터넷 창 닫아"], "windows": "taskkill /F /IM chrome.exe" },
+    "리그 오브 레전드 종료": { "target_name": "리그 오브 레전드", "action_type": "terminate", "aliases": ["롤 꺼줘", "롤 그만"], "windows": "taskkill /F /IM RiotClientServices.exe && taskkill /F /IM LeagueofLegends.exe" },
+    "LTspice 종료": { "target_name": "LTspice", "action_type": "terminate", "aliases": ["LTspice 꺼줘"], "windows": "taskkill /F /IM LTspice.exe" },
+    "계산기 종료": { "target_name": "계산기", "action_type": "terminate", "aliases": ["계산기 꺼줘"], "windows": "taskkill /F /IM calculator.exe" },
+    "Spotify 종료": { "target_name": "스포티파이", "action_type": "terminate", "aliases": ["스포티파이 꺼줘"], "windows": "taskkill /F /IM Spotify.exe" },
+    "Discord 종료": { "target_name": "디스코드", "action_type": "terminate", "aliases": ["디코 꺼줘"], "windows": "taskkill /F /IM Discord.exe" },
+    "Word 종료": { "target_name": "Microsoft Word", "action_type": "terminate", "aliases": ["워드 꺼줘"], "windows": "taskkill /F /IM WINWORD.EXE" },
+    "Excel 종료": { "target_name": "Microsoft Excel", "action_type": "terminate", "aliases": ["엑셀 꺼줘"], "windows": "taskkill /F /IM EXCEL.EXE" },
+    "PowerPoint 종료": { "target_name": "Microsoft PowerPoint", "action_type": "terminate", "aliases": ["파워포인트 꺼줘", "PPT 꺼줘"], "windows": "taskkill /F /IM POWERPNT.EXE" },
+
+    "## 주가 확인 (웹) ##": {},
+    "주가 검색": {
+        "target_name": "네이버 증권",
+        "action_type": "execute",
+        "aliases": ["주식", "증권", "주가 알려줘"],
+        "windows": "start https://finance.naver.com/"
+    },
+    "삼성전자 주가": {
+        "target_name": "삼성전자 주가",
+        "action_type": "execute",
+        "aliases": ["삼성전자", "삼전 주가", "삼성전자 얼마야"],
+        "windows": "start https://finance.naver.com/item/main.naver?code=005930"
+    },
+    "SK하이닉스 주가": {
+        "target_name": "SK하이닉스 주가",
+        "action_type": "execute",
+        "aliases": ["하이닉스", "하닉 주가", "SK하이닉스 얼마야"],
+        "windows": "start https://finance.naver.com/item/main.naver?code=000660"
+    },
+    "카카오 주가": {
+        "target_name": "카카오 주가",
+        "action_type": "execute",
+        "aliases": ["카카오", "카카오 주가", "카카오 얼마야"],
+        "windows": "start https://finance.naver.com/item/main.naver?code=035720"
+    },
+    "테슬라 주가": {
+        "target_name": "테슬라 주가",
+        "action_type": "execute",
+        "aliases": ["테슬라", "테슬라 주가", "테슬라 얼마야"],
+        "windows": "start https://finance.naver.com/world/item_stock.naver?symbol=TSLA"
+    },
+    "다우존스 지수": {
+        "target_name": "다우존스 산업 지수",
+        "action_type": "execute",
+        "aliases": ["다우 지수", "다우존스", "미국 증시"],
+        "windows": "start https://finance.naver.com/world/sise.naver?symbol=DJI@DJI"
+    },
+    "나스닥 지수": {
+        "target_name": "나스닥 종합 지수",
+        "action_type": "execute",
+        "aliases": ["나스닥", "나스닥 지수", "나스닥 얼마야"],
+        "windows": "start https://finance.naver.com/world/sise.naver?symbol=NAS@IXIC"
+    },
+    "S&P500 지수": {
+        "target_name": "S&P 500 지수",
+        "action_type": "execute",
+        "aliases": ["S&P 500", "에스앤피", "에스엔피 500"],
+        "windows": "start https://finance.naver.com/world/sise.naver?symbol=SPI@SPX"
+    },
+
+    "## 시스템 기능 ##": {},
+    "시간 확인": { "target_name": "현재 시간", "action_type": "fetch_and_report", "aliases": ["몇 시", "지금 몇시", "시간 알려줘"] },
+    "날씨 확인": { "target_name": "현재 날씨", "action_type": "fetch_and_report", "aliases": ["날씨", "오늘 날씨", "날씨 어때"] },
+    "휴지통 비우기": { "target_name": "휴지통", "action_type": "empty", "aliases": ["휴지통 비워줘", "파일 완전 삭제"], "windows": "powershell.exe -NoProfile -Command Clear-RecycleBin -Force" },
+    "스크린샷": { "target_name": "스크린샷", "action_type": "special", "aliases": ["화면 캡처", "스크린샷 찍어줘"], "windows": "" },
+    "시스템 종료": { "target_name": "시스템 종료", "action_type": "special", "aliases": ["컴퓨터 꺼줘", "시스템 종료", "PC 종료"], "windows": "shutdown /s /t 0" },
+    "시스템 재시작": { "target_name": "시스템 재시작", "action_type": "special", "aliases": ["컴퓨터 다시 시작", "재부팅", "리부팅"], "windows": "shutdown /r /t 0" }
+}
