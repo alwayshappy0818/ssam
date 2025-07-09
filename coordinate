@@ -1,12 +1,23 @@
 import cv2
 import json
 import numpy as np
+import os
 
-# --- 초기 설정 (위와 동일) ---
-ANNOTATION_FILE = 'train/_annotations.coco.json'
-with open(ANNOTATION_FILE, 'r') as f:
-    coco_data = json.load(f)
+# --- 설정 ---
+# ⚠️ 아래 두 줄을 자신의 환경에 맞게 수정하세요.
+ANNOTATION_FILE = 'D:/motor.coco/train/_annotations.coco.json'
+IMAGE_DIR = 'D:/motor.coco/train'
 
+# --- COCO JSON 파일 로드 ---
+try:
+    with open(ANNOTATION_FILE, 'r') as f:
+        coco_data = json.load(f)
+except FileNotFoundError:
+    print(f"오류: '{ANNOTATION_FILE}' 파일을 찾을 수 없습니다.")
+    print("스크립트 파일이 train, valid 폴더와 같은 위치에 있는지 확인하세요.")
+    exit()
+
+# 카테고리/이미지 정보 로드
 categories = {cat['id']: cat['name'] for cat in coco_data['categories']}
 images_info = {img['id']: img for img in coco_data['images']}
 annotations_by_image_id = {}
@@ -16,55 +27,63 @@ for ann in coco_data['annotations']:
         annotations_by_image_id[img_id] = []
     annotations_by_image_id[img_id].append(ann)
 
-# --- 핵심 기능 함수 ---
-def get_label_at_coordinate(image_filename, x, y):
-    """
-    주어진 이미지 파일명과 (x, y) 좌표를 기반으로 해당 위치의 라벨을 반환합니다.
-    """
-    # 파일명으로 이미지 ID 찾기
-    target_img_id = None
-    for img_id, img_info in images_info.items():
-        if img_info['file_name'] == image_filename:
-            target_img_id = img_id
-            break
-    
-    if target_img_id is None:
-        return f"오류: '{image_filename}' 파일을 찾을 수 없습니다."
+# --- 핵심 기능 함수 (이전과 동일) ---
+def get_label_at_coordinate(image_id, x, y):
+    if image_id not in annotations_by_image_id:
+        return "Background"
 
-    # 해당 이미지의 어노테이션 가져오기
-    if target_img_id not in annotations_by_image_id:
-        return "Background" # 어노테이션 없음
-
-    annotations = annotations_by_image_id[target_img_id]
+    annotations = annotations_by_image_id[image_id]
     point = (x, y)
 
-    # 모든 어노테이션을 순회하며 점이 내부에 있는지 확인
     for ann in annotations:
         segmentation = ann['segmentation'][0]
         contour = np.array(segmentation).reshape((-1, 1, 2)).astype(np.int32)
-        
-        # 점이 폴리곤 내부에 있는지 테스트
-        # 반환값 > 0: 내부, == 0: 경계선, < 0: 외부
         distance = cv2.pointPolygonTest(contour, point, False)
-        
         if distance >= 0:
             category_id = ann['category_id']
-            return categories[category_id] # 라벨 이름 반환
-
-    # 어떤 객체에도 속하지 않으면 배경
+            return categories[category_id]
+            
     return "Background"
 
-# --- 함수 사용 예제 ---
-# 확인할 이미지 파일명
-target_image = 'motor_image_01.jpg' # 예시 파일명입니다. 실제 파일명으로 변경하세요.
+# --- 🖱️ 상호작용을 위한 추가 코드 ---
 
-# 확인할 좌표 (x, y)
-coord_1 = (250, 300)
-coord_2 = (10, 10)
+# ⚠️ 테스트하고 싶은 이미지 파일명을 여기에 입력하세요.
+TARGET_IMAGE_FILENAME = '-2025-06-26-7-_png.rf.4fdedba67f54def9fc7a77b52fd7e2b1.jpg' # 본인의 실제 파일명으로 변경!
 
-# 함수 호출 및 결과 출력
-label_1 = get_label_at_coordinate(target_image, coord_1[0], coord_1[1])
-print(f"좌표 {coord_1}의 라벨: {label_1}")
+# 파일명으로 이미지 정보 찾기
+target_image_info = None
+for img in images_info.values():
+    if img['file_name'] == TARGET_IMAGE_FILENAME:
+        target_image_info = img
+        break
 
-label_2 = get_label_at_coordinate(target_image, coord_2[0], coord_2[1])
-print(f"좌표 {coord_2}의 라벨: {label_2}")
+if not target_image_info:
+    print(f"오류: '{TARGET_IMAGE_FILENAME}' 이미지 정보를 어노테이션 파일에서 찾을 수 없습니다.")
+    exit()
+
+# 이미지 불러오기
+image_path = os.path.join(IMAGE_DIR, target_image_info['file_name'])
+image = cv2.imread(image_path)
+if image is None:
+    print(f"오류: '{image_path}' 이미지 파일을 불러올 수 없습니다.")
+    exit()
+
+# 마우스 클릭 이벤트를 처리할 함수
+def mouse_callback(event, x, y, flags, param):
+    if event == cv2.EVENT_LBUTTONDOWN: # 마우스 왼쪽 버튼 클릭 시
+        label = get_label_at_coordinate(target_image_info['id'], x, y)
+        print(f"좌표 ({x}, {y})의 라벨: {label}")
+        # 클릭한 위치에 초록색 원 그리기
+        cv2.circle(image, (x, y), 5, (0, 255, 0), -1)
+        cv2.imshow("Image", image)
+
+# --- 실행 ---
+print(f"'{TARGET_IMAGE_FILENAME}' 이미지를 표시합니다.")
+print("이미지 위를 클릭하여 해당 위치의 라벨을 확인하세요.")
+print("종료하려면 'q' 키를 누르세요.")
+
+cv2.namedWindow('Image')
+cv2.setMouseCallback('Image', mouse_callback)
+cv2.imshow('Image', image)
+cv2.waitKey(0)
+cv2.destroyAllWindows()
