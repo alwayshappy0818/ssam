@@ -1,0 +1,70 @@
+import cv2
+import json
+import numpy as np
+
+# --- 초기 설정 (위와 동일) ---
+ANNOTATION_FILE = 'train/_annotations.coco.json'
+with open(ANNOTATION_FILE, 'r') as f:
+    coco_data = json.load(f)
+
+categories = {cat['id']: cat['name'] for cat in coco_data['categories']}
+images_info = {img['id']: img for img in coco_data['images']}
+annotations_by_image_id = {}
+for ann in coco_data['annotations']:
+    img_id = ann['image_id']
+    if img_id not in annotations_by_image_id:
+        annotations_by_image_id[img_id] = []
+    annotations_by_image_id[img_id].append(ann)
+
+# --- 핵심 기능 함수 ---
+def get_label_at_coordinate(image_filename, x, y):
+    """
+    주어진 이미지 파일명과 (x, y) 좌표를 기반으로 해당 위치의 라벨을 반환합니다.
+    """
+    # 파일명으로 이미지 ID 찾기
+    target_img_id = None
+    for img_id, img_info in images_info.items():
+        if img_info['file_name'] == image_filename:
+            target_img_id = img_id
+            break
+    
+    if target_img_id is None:
+        return f"오류: '{image_filename}' 파일을 찾을 수 없습니다."
+
+    # 해당 이미지의 어노테이션 가져오기
+    if target_img_id not in annotations_by_image_id:
+        return "Background" # 어노테이션 없음
+
+    annotations = annotations_by_image_id[target_img_id]
+    point = (x, y)
+
+    # 모든 어노테이션을 순회하며 점이 내부에 있는지 확인
+    for ann in annotations:
+        segmentation = ann['segmentation'][0]
+        contour = np.array(segmentation).reshape((-1, 1, 2)).astype(np.int32)
+        
+        # 점이 폴리곤 내부에 있는지 테스트
+        # 반환값 > 0: 내부, == 0: 경계선, < 0: 외부
+        distance = cv2.pointPolygonTest(contour, point, False)
+        
+        if distance >= 0:
+            category_id = ann['category_id']
+            return categories[category_id] # 라벨 이름 반환
+
+    # 어떤 객체에도 속하지 않으면 배경
+    return "Background"
+
+# --- 함수 사용 예제 ---
+# 확인할 이미지 파일명
+target_image = 'motor_image_01.jpg' # 예시 파일명입니다. 실제 파일명으로 변경하세요.
+
+# 확인할 좌표 (x, y)
+coord_1 = (250, 300)
+coord_2 = (10, 10)
+
+# 함수 호출 및 결과 출력
+label_1 = get_label_at_coordinate(target_image, coord_1[0], coord_1[1])
+print(f"좌표 {coord_1}의 라벨: {label_1}")
+
+label_2 = get_label_at_coordinate(target_image, coord_2[0], coord_2[1])
+print(f"좌표 {coord_2}의 라벨: {label_2}")
