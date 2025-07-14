@@ -32,7 +32,7 @@ except Exception as e:
     sys.exit(1)
 
 try:
-    DEEPSEEK_API_KEY = "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"
+    DEEPSEEK_API_KEY = " Your API KEY "
     VOICE = "ko-KR-SunHiNeural"
 except Exception:
     pass
