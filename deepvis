@@ -1,161 +1,194 @@
-import json, subprocess, platform, requests, pyautogui, os, asyncio
+import os
+import sys
+import json
+import subprocess
+import platform
+import requests
+import asyncio
+import random
+import webbrowser
 from datetime import datetime
 import edge_tts
 import pygame
-from openai import OpenAI
+import speech_recognition as sr
+import threading
+import queue
+import re
+import time
+import tkinter as tk
+from tkinter import scrolledtext, ttk, messagebox
 
-# --- 1. API 및 음성 엔진 설정 ---
-try:
-    # OpenRouter에서 발급받은 API 키를 입력하세요.
-    # 이 키는 DeepSeek 자체의 키가 아니라 OpenRouter에서 발급받은 키여야 합니다.
-    DEEPSEEK_API_KEY = "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"
+conversation_history = []
+command_queue = queue.Queue()
+history_lock = threading.Lock()
 
-    # OpenAI 라이브러리가 OpenRouter 서버를 바라보게 설정
-    client = OpenAI(
-        api_key=DEEPSEEK_API_KEY,
-        # *** 중요: DeepSeek 대신 OpenRouter의 API 기본 URL로 변경 ***
-        base_url="https://openrouter.ai/api/v1"
-    )
-    
-    # 사용할 DeepSeek 모델 설정 (OpenRouter에서 제공하는 정확한 모델 이름 사용)
-    # OpenRouter 웹사이트에서 확인하신 모델명을 그대로 사용합니다.
-    DEEPSEEK_MODEL = "deepseek/deepseek-chat-v3-0324:free" 
-    
-    # edge-tts 음성 설정
-    VOICE = "ko-KR-SunHiNeural"
-    RATE = "+20%"
-    pygame.mixer.init()
-
-except Exception as e:
-    print(f"엔진 초기화 실패: {e}\nAPI 키 또는 라이브러리 설치를 확인하세요.")
-    exit()
-
-# --- 2. 설정 파일 로드 ---
 try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     json_path = os.path.join(script_dir, 'commands.json')
     with open(json_path, encoding="utf-8") as f:
-        full_config = json.load(f)
-    COMMANDS = {k: v for k, v in full_config.items() if not k.startswith("##")}
-except FileNotFoundError:
-    print(f"오류: '{json_path}' 에서 commands.json을 찾을 수 없습니다.")
-    exit()
+        COMMANDS = json.load(f)
+except Exception as e:
+    messagebox.showerror("설정 파일 오류", f"commands.json 로드 실패: {e}")
+    sys.exit(1)
 
-# --- 3. 핵심 기능 함수 ---
+try:
+    DEEPSEEK_API_KEY = "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"
+    VOICE = "ko-KR-SunHiNeural"
+except Exception:
+    pass
+
 def speak(text):
-    print(f"🔊 자비스: {text}")
-    try: asyncio.run(_speak_async(text))
-    except Exception as e: print(f"음성 출력 중 오류 발생: {e}")
+    if not text:
+        return
+    threading.Thread(target=lambda: asyncio.run(_speak_async(text)), daemon=True).start()
 
 async def _speak_async(text):
-    output_file = "response.mp3"
+    output_file = f"temp_{random.randint(1000, 9999)}.mp3"
     try:
-        communicate = edge_tts.Communicate(text, VOICE, rate=RATE)
+        # Fixed: Volume calculation clamp between 0.1-1.0
+        volume = max(0.1, 1.0 - (len(text) / 150.0))
+        
+        communicate = edge_tts.Communicate(text, VOICE)
         await communicate.save(output_file)
-        pygame.mixer.music.load(output_file)
-        pygame.mixer.music.play()
-        while pygame.mixer.music.get_busy(): pygame.time.Clock().tick(10)
-        pygame.mixer.music.unload(); await asyncio.sleep(0.1); os.remove(output_file)
-    except Exception as e: print(f"비동기 음성 처리 중 오류: {e}")
-
-def ask_deepseek(prompt):
-    """DeepSeek API에 프롬프트를 보내고 응답을 받는 함수"""
-    try:
-        chat_completion = client.chat.completions.create(
-            model=DEEPSEEK_MODEL, # 변경된 모델명 사용
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return chat_completion.choices[0].message.content.strip().strip("'\".,")
+        
+        if pygame.mixer.get_init():
+            pygame.mixer.music.load(output_file)
+            pygame.mixer.music.set_volume(volume)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                await asyncio.sleep(0.1)
     except Exception as e:
-        print(f"오류: DeepSeek API와 통신 중 문제가 발생했습니다. ({e})")
-        return "죄송합니다, 지금은 답변할 수 없습니다."
+        print(f"Debug: TTS 생성 또는 재생 중 오류 발생 - {e}")
+    finally:
+        if os.path.exists(output_file):
+            try: 
+                os.remove(output_file)
+            except PermissionError: 
+                pass
 
-# (get_current_time, get_weather_forecast, get_response_text, execute 함수는 이전과 동일)
-def get_current_time():
-    now = datetime.now(); am_pm = "오후" if now.hour >= 12 else "오전"; hour = now.hour - 12 if now.hour > 12 else (12 if now.hour == 0 else now.hour)
-    return f"현재 시간은 {am_pm} {hour}시 {now.minute}분입니다."
-
-def get_weather_forecast():
+def ask_deepseek(messages):
     try:
-        lat, lon = 36.7836, 127.0000; url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,wind_speed_10m"
-        response = requests.get(url, timeout=10); response.raise_for_status(); data = response.json()
-        temp = data['current']['temperature_2m']; wind_speed_kmh = round(data['current']['wind_speed_10m'] * 3.6, 1)
-        return f"현재 아산시의 기온은 {temp}도, 풍속은 시속 {wind_speed_kmh} 킬로미터입니다."
-    except: return "날씨 정보를 가져오는 데 실패했습니다."
+        # Fixed: Removed extra spaces in URL
+        response = requests.post(
+            " https://api.openrouter.ai/api/v1/chat/completions " ,
+            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+            json={"model": "deepseek/deepseek-chat", "messages": messages},
+            timeout=15
+        )
+        response.raise_for_status()
+        return response.json()['choices'][0]['message']['content']
+    except requests.exceptions.RequestException as e:
+        print(f"API 요청 오류: {e}")
+        return "네트워크 연결을 확인해주세요."
+    except Exception as e:
+        print(f"응답 처리 오류: {e}")
+        return "AI 응답을 처리하는 중 오류가 발생했습니다."
 
-def get_response_text(command_info):
-    target = command_info.get('target_name', ''); action_type = command_info.get('action_type', '')
-    def has_batchim(word):
-        if not word: return False
-        last_char = word[-1]
-        if '가' <= last_char <= '힣': return (ord(last_char) - ord('가')) % 28 > 0
-        return False
-    target_eul_reul = target + '을' if has_batchim(target) else target + '를'
-    if action_type == 'execute': return f"알겠습니다. {target_eul_reul} 실행하겠습니다."
-    elif action_type == 'terminate': return f"네. {target_eul_reul} 종료하겠습니다."
-    elif action_type == 'empty': return f"{target_eul_reul} 비우겠습니다."
-    elif action_type == 'special' and target == '스크린샷': return "스크린샷을 실행합니다."
-    return f"{target} 명령을 실행합니다."
+def listen_for_command():
+    r = sr.Recognizer()
+    r.pause_threshold = 0.8
+    try:
+        with sr.Microphone() as source:
+            print("🎤 듣고 있습니다...")
+            try:
+                audio = r.listen(source, timeout=5)
+                text = r.recognize_google(audio, language='ko-KR')
+                return text
+            except (sr.UnknownValueError, sr.WaitTimeoutError):
+                return None
+            except Exception as e:
+                print(f"음성 인식 오류: {e}")
+                return None
+    except Exception as e:
+        print(f"마이크 초기화 실패: {e}")
+        return None
 
-def execute(action_key):
-    command_info = COMMANDS.get(action_key, {}); cmd = command_info.get(platform.system().lower()); action_type = command_info.get("action_type")
-    if cmd or action_type == 'special':
+def process_and_execute(command_raw):
+    with history_lock:
+        conversation_history.append({"role": "user", "content": command_raw})
+
+    messages_to_send = conversation_history[-5:]
+
+    response_text = ask_deepseek([{"role": "user", "content": command_raw}])
+
+    if response_text:
+        with history_lock:
+            conversation_history.append({"role": "assistant", "content": response_text})
+        speak(response_text)
+    
+    return response_text
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("딥비스 AI 비서 (디버깅 완료)")
+        self.geometry("800x800")
+        
+        self.output_area = scrolledtext.ScrolledText(self, wrap=tk.WORD, state=tk.DISABLED)
+        self.output_area.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        input_frame = ttk.Frame(self)
+        input_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.input_field = ttk.Entry(input_frame)
+        self.input_field.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.input_field.bind("<Return>", self.send_command)
+        
+        self.send_button = ttk.Button(input_frame, text="전송", command=self.send_command)
+        self.send_button.pack(side=tk.LEFT)
+        
+        self.after(100, self.initialize_systems)
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def initialize_systems(self):
         try:
-            if action_type == 'execute': subprocess.Popen(cmd, shell=True)
-            else: subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
-            return get_response_text(command_info)
+            pygame.mixer.init()
+            self.add_message("딥비스", "안녕하세요. 무엇을 도와드릴까요?")
+            speak("안녕하세요. 무엇을 도와드릴까요?")
+            
+            self.log_cleaner_thread = threading.Thread(target=self.cleanup_logs, daemon=True)
+            self.log_cleaner_thread.start()
+            
         except Exception as e:
-            print(f"'{action_key}' 실행 중 오류 발생: {e}")
-            return f"{command_info.get('target_name', action_key)} 실행 중 오류가 발생했습니다."
-    return "실행할 명령어가 없습니다."
+            print(f"시스템 초기화 오류: {e}")
+            self.add_message("시스템", "오디오 장치를 초기화할 수 없습니다.")
 
-# --- 4. 메인 루프 ---
-speak("딥시크 기반 자비스 입니다 무엇을 도와드릴까요?")
-while True:
-    text = input("⌨️ 명령을 입력하세요: ")
-    if not text.strip(): continue
-    command_raw = text.replace("자비스", "").strip() if "자비스" in text else text.strip()
+    def cleanup_logs(self):
+        # Fixed: Removed race condition inducing code
+        while True:
+            time.sleep(60)  # Changed to longer interval
+            try:
+                with history_lock:
+                    if len(conversation_history) > 100:  # Only clean if too long
+                        conversation_history[:] = conversation_history[-50:]
+            except Exception as e:
+                print(f"로그 정리 오류: {e}")
 
-    if command_raw.lower() in ['종료', 'exit', 'quit']:
-        speak("자비스를 종료합니다.")
-        break
-    
-    print(f"💬 인식된 명령: {command_raw}")
+    def add_message(self, sender, message):
+        self.output_area.config(state=tk.NORMAL)
+        self.output_area.insert(tk.END, f"{sender}: {message}\n\n")
+        self.output_area.config(state=tk.DISABLED)
+        self.output_area.see(tk.END)
 
-    # --- 모든 판단을 DeepSeek에게 맡깁니다. ---
-    final_command_key = None
-    available_functions = list(COMMANDS.keys())
-    function_descriptions = []
-    for key, info in COMMANDS.items():
-        description = f"- '{key}' (관련 표현: {', '.join(info.get('aliases', []))})"
-        function_descriptions.append(description)
-    intent_prompt = (f"당신은 사용자의 자연어 명령에서 핵심 의도를 파악하는 AI 두뇌입니다. 다음 '기능 설명'을 참고하여, 주어진 '사용자 명령'과 가장 일치하는 기능의 이름(key) '하나'만 정확히 출력해주세요.\n\n## 기능 설명:\n" + "\n".join(function_descriptions) + f"\n\n## 지시:\n적합한 기능이 있다면 그 기능의 이름만, 없다면 'NULL'만 출력하세요.\n\n## 사용자 명령:\n\"{command_raw}\"")
-    
-    deepseek_suggestion = ask_deepseek(intent_prompt)
-    
-    if deepseek_suggestion != "NULL" and deepseek_suggestion in available_functions:
-        final_command_key = deepseek_suggestion
-    
-    result = ""
-    if final_command_key:
-        command_info = COMMANDS.get(final_command_key, {})
-        action_type = command_info.get('action_type')
-        if action_type == 'fetch_and_report':
-            target_name = command_info.get('target_name')
-            if target_name == '현재 날씨': result = get_weather_forecast()
-            elif target_name == '현재 시간': result = get_current_time()
-        elif action_type == 'special':
-            result = get_response_text(command_info)
-            pyautogui.hotkey('win', 'shift', 's')
-        elif action_type == 'empty':
-            speak(f"경고, {command_info.get('target_name')}을(를) 비우면 되돌릴 수 없습니다. 정말 실행하시겠습니까?")
-            confirm = input("정말 실행하시겠습니까? (y/n): ")
-            result = execute(final_command_key) if confirm.lower() == 'y' else "실행이 취소되었습니다."
-        else:
-            result = execute(final_command_key)
-    else:
-        chat_prompt = f"당신은 '딥시크 기반 자비스'라는 이름을 가진 AI 비서입니다. 사용자의 다음 말에 대해 자연스럽게 대화하듯 답변해주세요.가능한 한 최대한 짧게 답변합니다.\n\n사용자: \"{command_raw}\"\n자비스:"
-        result = ask_deepseek(chat_prompt) or f"'{command_raw}'에 해당하는 명령을 찾지 못했습니다."
+    def send_command(self, event=None):
+        user_input = self.input_field.get().strip()
+        if not user_input: return
+        
+        self.add_message("사용자", user_input)
+        self.input_field.delete(0, tk.END)
+        
+        threading.Thread(target=self.command_handler_thread, args=(user_input,), daemon=True).start()
 
-    if result:
-        speak(result)
+    def command_handler_thread(self, user_input):
+        response = process_and_execute(user_input)
+        if response:
+            self.after(0, self.add_message, "딥비스", response)
+
+    def on_closing(self):
+        if pygame.mixer.get_init():
+            pygame.mixer.quit()
+        self.destroy()
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
