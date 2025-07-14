@@ -45,7 +45,6 @@ def speak(text):
 async def _speak_async(text):
     output_file = f"temp_{random.randint(1000, 9999)}.mp3"
     try:
-        # Fixed: Volume calculation clamp between 0.1-1.0
         volume = max(0.1, 1.0 - (len(text) / 150.0))
         
         communicate = edge_tts.Communicate(text, VOICE)
@@ -68,9 +67,8 @@ async def _speak_async(text):
 
 def ask_deepseek(messages):
     try:
-        # Fixed: Removed extra spaces in URL
         response = requests.post(
-            " https://api.openrouter.ai/api/v1/chat/completions " ,
+            " Your Base url " ,
             headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
             json={"model": "deepseek/deepseek-chat", "messages": messages},
             timeout=15
@@ -154,12 +152,11 @@ class App(tk.Tk):
             self.add_message("시스템", "오디오 장치를 초기화할 수 없습니다.")
 
     def cleanup_logs(self):
-        # Fixed: Removed race condition inducing code
         while True:
-            time.sleep(60)  # Changed to longer interval
+            time.sleep(60)
             try:
                 with history_lock:
-                    if len(conversation_history) > 100:  # Only clean if too long
+                    if len(conversation_history) > 100:
                         conversation_history[:] = conversation_history[-50:]
             except Exception as e:
                 print(f"로그 정리 오류: {e}")
