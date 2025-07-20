@@ -1,0 +1,1114 @@
+# alfred.py (Python 3.11 최적화 버전)
+import io, os, sys, json, subprocess, platform, requests, asyncio, webbrowser, re, time, queue, urllib.parse
+from datetime import datetime, timedelta
+import edge_tts, pygame, speech_recognition as sr, tkinter as tk
+from openai import OpenAI
+from bs4 import BeautifulSoup
+from tkinter import scrolledtext
+import threading
+import math
+import numpy as np
+import base64
+import hashlib
+import logging
+import functools
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from sentence_transformers import SentenceTransformer  # 로컬 임베딩 모델
+import glob
+import importlib.util
+
+class PluginManager:
+    def __init__(self, alfred_app):
+        self.alfred = alfred_app
+        self.plugins = []
+        self.plugin_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins")
+        
+    def load_plugins(self):
+        """플러그인 디렉토리에서 모든 플러그인 로드"""
+        if not os.path.exists(self.plugin_dir):
+            os.makedirs(self.plugin_dir)
+            self.alfred.add_message("시스템", "플러그인 디렉토리가 생성되었습니다", "status_tag")
+            return
+            
+        plugin_files = glob.glob(os.path.join(self.plugin_dir, "*.py"))
+        for plugin_file in plugin_files:
+            try:
+                module_name = os.path.splitext(os.path.basename(plugin_file))[0]
+                spec = importlib.util.spec_from_file_location(module_name, plugin_file)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                
+                if hasattr(module, 'register_plugin'):
+                    plugin_info = module.register_plugin(self.alfred)
+                    if not isinstance(plugin_info, dict):
+                        raise ValueError("register_plugin은 dict를 반환해야 합니다")
+                        
+                    self.plugins.append(plugin_info)
+                    self.alfred.add_message("시스템", 
+                                          f"플러그인 로드: {plugin_info.get('name', 'Unknown')} (v{plugin_info.get('version', '1.0')})",
+                                          "status_tag")
+            except Exception as e:
+                self.alfred.add_message("시스템", 
+                                      f"플러그인 로드 실패: {os.path.basename(plugin_file)} - {str(e)}",
+                                      "status_tag")
+                logger.error(f"플러그인 로드 오류: {plugin_file} - {e}")
+
+    def handle_command(self, command: str) -> dict:
+        """명령어를 플러그인에서 처리"""
+        for plugin in self.plugins:
+            try:
+                if 'handle_command' in plugin:
+                    result = plugin['handle_command'](self.alfred, command)
+                    if result and isinstance(result, dict):
+                        return result
+            except Exception as e:
+                self.alfred.add_message("시스템", 
+                                      f"플러그인 오류: {plugin.get('name', 'Unknown')} - {str(e)}",
+                                      "status_tag")
+                logger.error(f"플러그인 실행 오류: {plugin.get('name', 'Unknown')} - {e}")
+        return None
+# 로깅 설정
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('Alfred')
+
+# 임베딩 기반 메모리 시스템 (로컬 모델 사용)
+class EmbeddingMemory:
+    def __init__(self):
+        self.embeddings = []  # 임베딩 벡터 저장
+        self.documents = []    # 원본 문서 저장
+        self.cache = {}        # 임베딩 캐시 (텍스트 해시 -> 임베딩)
+        self.model = None      # 로컬 임베딩 모델
+        
+    def load_local_model(self):
+        """로컬 임베딩 모델 로드"""
+        try:
+            # 경량 한국어 임베딩 모델 (CPU 전용으로 로드)
+            self.model = SentenceTransformer(
+                'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2',
+                device='cpu'
+            )
+            logger.info("로컬 임베딩 모델 로드 완료")
+            return True
+        except Exception as e:
+            logger.error(f"로컬 임베딩 모델 로드 실패: {e}")
+            self.model = None
+            return False
+    
+    def get_embedding(self, text):
+        """텍스트의 임베딩을 가져오거나 캐시에서 반환"""
+        if not text:
+            return np.zeros(384).tolist()  # 기본 차원 (MiniLM-L12-v2는 384차원)
+        
+        # 텍스트 해시 생성
+        text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
+        
+        # 캐시에 존재하면 반환
+        if text_hash in self.cache:
+            return self.cache[text_hash]
+        
+        # 로컬 모델로 임베딩 생성
+        if self.model:
+            try:
+                # 텍스트 길이 제한 (성능 향상)
+                truncated_text = text[:512]  # 512토큰으로 제한
+                embedding = self.model.encode(truncated_text).tolist()
+                self.cache[text_hash] = embedding
+                return embedding
+            except Exception as e:
+                logger.error(f"로컬 임베딩 생성 오류: {e}")
+        
+        # 오류 시 0 벡터 반환
+        return np.zeros(384).tolist()
+    
+    def add_document(self, text):
+        """새 문서 추가"""
+        if not text or len(text) < 5:
+            return
+            
+        embedding = self.get_embedding(text)
+        self.documents.append(text)
+        self.embeddings.append(embedding)
+        
+        # 최대 300개 문서 유지 (메모리 절약)
+        if len(self.documents) > 300:
+            self.documents.pop(0)
+            self.embeddings.pop(0)
+    
+    def cosine_similarity(self, vec1, vec2):
+        """두 벡터 간의 코사인 유사도 계산 (수치 안정성 강화)"""
+        vec1 = np.array(vec1)
+        vec2 = np.array(vec2)
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0
+            
+        # 작은 값 추가로 수치 안정성 확보
+        epsilon = 1e-8
+        return np.dot(vec1, vec2) / ((norm1 * norm2) + epsilon)
+    
+    def retrieve_similar(self, query, n_results=3):
+        """쿼리와 유사한 문서 검색"""
+        if not self.documents:
+            return []
+            
+        # 쿼리 임베딩 생성
+        query_embedding = self.get_embedding(query)
+        
+        # 유사도 계산 (배치 처리로 성능 향상)
+        scores = []
+        batch_size = 50
+        total_docs = len(self.embeddings)
+        
+        for i in range(0, total_docs, batch_size):
+            batch_embeddings = self.embeddings[i:i+batch_size]
+            batch_scores = [self.cosine_similarity(query_embedding, emb) for emb in batch_embeddings]
+            scores.extend(batch_scores)
+        
+        # 상위 n_results개 문서 반환 (유사도 0.6 이상만)
+        indexed_scores = [(score, i) for i, score in enumerate(scores)]
+        indexed_scores.sort(key=lambda x: x[0], reverse=True)
+        
+        results = []
+        for score, idx in indexed_scores[:n_results]:
+            if score > 0.6:
+                results.append(self.documents[idx])
+        return results
+
+# 사용자 프로필 클래스 (변경 없음)
+class UserProfile:
+    def __init__(self, profile_path="user_profile.json"):
+        self.profile_path = profile_path
+        self.profile = self.load_profile()
+        
+    def load_profile(self):
+        try:
+            if os.path.exists(self.profile_path):
+                with open(self.profile_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            return {"personal_facts": {}, "preferences": {}}
+        except Exception:
+            return {"personal_facts": {}, "preferences": {}}
+            
+    def save_profile(self):
+        try:
+            with open(self.profile_path, 'w', encoding='utf-8') as f:
+                json.dump(self.profile, f, ensure_ascii=False, indent=2)
+            return True
+        except Exception as e:
+            logger.error(f"프로필 저장 오류: {e}")
+            return False
+            
+    def update_profile(self, new_data):
+        for category, data in new_data.items():
+            if category not in self.profile:
+                self.profile[category] = {}
+            self.profile[category].update(data)
+        self.save_profile()
+        
+    def get_context(self):
+        context = []
+        if self.profile["personal_facts"]:
+            context.append("[사용자 정보]")
+            for key, value in self.profile["personal_facts"].items():
+                context.append(f"- {key}: {value}")
+        if self.profile["preferences"]:
+            context.append("\n[사용자 선호도]")
+            for key, value in self.profile["preferences"].items():
+                context.append(f"- {key}: {value}")
+        return "\n".join(context) if context else ""
+
+if platform.system() == 'Windows':
+    try:
+        import win32gui, uiautomation as auto, pythoncom
+    except ImportError:
+        auto, win32gui, pythoncom = None, None, None
+else:
+    auto, win32gui, pythoncom = None, None, None
+
+# 타임아웃 데코레이터 추가
+def timeout(seconds=15):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(func, *args, **kwargs)
+                try:
+                    return future.result(timeout=seconds)
+                except TimeoutError:
+                    instance = args[0]  # self 인스턴스
+                    instance.add_message("시스템", "⚠️ 명령 처리 시간이 초과되었습니다", "status_tag")
+                    return None
+        return wrapper
+    return decorator
+
+class App(tk.Tk):
+    def show_plugins(self):
+        if not self.plugin_manager.plugins:
+            self.add_message("시스템", "로드된 플러그인이 없습니다", "status_tag")
+            return
+            
+        plugin_list = "\n".join(
+            f"- {p['name']} (v{p.get('version', '1.0')})" 
+            for p in self.plugin_manager.plugins
+        )
+        self.add_message("시스템", f"로드된 플러그인:\n{plugin_list}", "status_tag")
+
+    def __init__(self):
+        super().__init__()
+        self.protocol("WM_DELETE_WINDOW", self.close_app)
+        self.running = True
+        self.is_listening = True
+        self.is_speaking = threading.Event()
+        self.conversation_context = {"active_tab": {"title": "", "url": ""}}
+        self.conversation_history = []
+        self.gui_queue = queue.Queue()
+        self.context_lock = threading.Lock()
+        self.active_threads = {}  # 응답 없는 스레드 감지용
+        self.plugin_manager = PluginManager(self)
+        self.plugin_manager.load_plugins()       
+        # 메모리 시스템 초기화 (로컬 임베딩 기반)
+        self.memory_model = EmbeddingMemory()
+        self.memory_model.load_local_model()  # 로컬 모델 로드
+        
+        # 사용자 프로필 초기화
+        self.user_profile = UserProfile()
+        
+        try:
+            # Windows 오디오 드라이버 문제 해결
+            if platform.system() == "Windows":
+                os.environ["SDL_AUDIODRIVER"] = "directsound"
+            
+            # Pygame 안전 초기화
+            if not pygame.get_init():
+                pygame.mixer.init(buffer=1024)
+            
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            
+            # 메모리 파일 경로 설정
+            self.memory_path = os.path.join(script_dir, 'memory.json')
+            self.load_memory()  # 앱 시작 시 과거 대화 기록 불러오기
+            
+            config_path = os.path.join(script_dir, 'config.json')
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f: 
+                    self.CONFIG = json.load(f)
+            else:
+                self.CONFIG = {
+                    "DEEPSEEK_API_KEY": "YOUR API KEY",
+                    "DEEPSEEK_MODEL": "deepseek/deepseek-chat-v3-0324:free",
+                    "USER_NAME": "사용자",
+                    "USE_API_FOR_MEMORY": False,  # API 사용 여부 플래그
+                    "SHOW_SYSTEM_MESSAGES": False,  # 시스템 메시지 표시 여부
+                    "WEATHER_API_KEY": "YOUR_WEATHER_API_KEY"  # 날씨 API 키
+                }
+                with open(config_path, 'w', encoding='utf-8') as f: 
+                    json.dump(self.CONFIG, f, indent=4)
+            
+            json_path = os.path.join(script_dir, 'commands.json')
+            with open(json_path, encoding="utf-8") as f: 
+                self.COMMANDS = json.load(f)
+            
+            self.client = OpenAI(
+                api_key=self.CONFIG.get("DEEPSEEK_API_KEY"),
+                base_url="https://openrouter.ai/api/v1"
+            )
+            self.VOICE = "ko-KR-SunHiNeural"
+            self.RATE = "+70%"
+        except Exception as e:
+            logger.error(f"초기화 오류: {e}")
+            self.destroy()
+            sys.exit(1)
+        
+        # GUI 설정
+        self.title("알프레드")
+        self.geometry("600x700")
+        self.configure(bg="#121212")
+        self.output_area = scrolledtext.ScrolledText(
+            self, wrap=tk.WORD, bg="#1E1E1E", fg="#E0E0E0", 
+            font=("Malgun Gothic", 10), relief=tk.FLAT, 
+            borderwidth=0, padx=10, pady=10
+        )
+        self.output_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.output_area.config(state=tk.DISABLED)
+        self.output_area.tag_config("user_tag", foreground="#FFD700", font=("Malgun Gothic", 10, "bold"))
+        self.output_area.tag_config("assistant_tag", foreground="#87CEEB", font=("Malgun Gothic", 10, "bold"))
+        self.output_area.tag_config("status_tag", foreground="#AAAAAA", font=("Malgun Gothic", 9, "italic"))
+        self.output_area.tag_config("memory_tag", foreground="#98FB98", font=("Malgun Gothic", 9))
+        
+        input_frame = tk.Frame(self, bg="#121212")
+        input_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        self.input_field = tk.Entry(
+            input_frame, bg="#2C2C2C", fg="#E0E0E0", 
+            font=("Malgun Gothic", 10), relief=tk.FLAT, 
+            insertbackground="white"
+        )
+        self.input_field.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5, padx=(0, 5))
+        self.input_field.bind("<Return>", lambda event: self.send_command())
+        
+        button_frame = tk.Frame(input_frame, bg="#121212")
+        button_frame.pack(side=tk.LEFT)
+        
+        self.voice_button = tk.Button(
+            button_frame, text="🎤", command=self.toggle_voice_input, 
+            bg="#4CAF50", fg="white", relief="flat", width=4
+        )
+        self.voice_button.pack(side=tk.LEFT, padx=2)
+        
+        self.stop_button = tk.Button(
+            button_frame, text="🔇", command=self.stop_speech, 
+            bg="#FF9800", fg="white", relief="flat", width=4
+        )
+        self.stop_button.pack(side=tk.LEFT, padx=2)
+        
+        self.exit_button = tk.Button(
+            button_frame, text="🚪", command=self.close_app, 
+            bg="#F44336", fg="white", relief="flat", width=4
+        )
+        self.exit_button.pack(side=tk.LEFT, padx=2)
+        
+        # 백그라운드 스레드 시작
+        threading.Thread(target=self.voice_input_worker, daemon=True).start()
+        threading.Thread(target=self.monitor_threads, daemon=True).start()  # 스레드 모니터링
+        self.after(100, self.check_gui_queue)
+        
+        if platform.system() == "Windows" and auto is not None:
+            threading.Thread(target=self.monitor_active_tab, daemon=True).start()
+        
+        if self.CONFIG.get("SHOW_SYSTEM_MESSAGES", False):
+            self.gui_queue.put({'type': 'update_voice_button', 'text': "🎤...", 'bg': "#FFC107"})
+            self.add_message("시스템", "듣고 있습니다...", "status_tag")
+        self.after(500, self.initial_greeting)
+
+    def monitor_threads(self):
+        """응답 없는 스레드 감지"""
+        while self.running:
+            time.sleep(10)
+            current_time = time.time()
+            for tid, start_time in list(self.active_threads.items()):
+                if current_time - start_time > 60:  # 60초 이상 실행 중
+                    logger.warning(f"응답 없는 스레드 감지: {tid}")
+                    del self.active_threads[tid]
+                    self.add_message("시스템", "⚠️ 명령 처리 지연으로 재시작합니다", "status_tag")
+
+    def load_memory(self):
+        """앱 시작 시 memory.json 파일에서 대화 기록을 불러옵니다."""
+        try:
+            if os.path.exists(self.memory_path):
+                with open(self.memory_path, 'r', encoding='utf-8') as f:
+                    self.conversation_history = json.load(f)
+                    logger.info(f"기억 로드 완료: {len(self.conversation_history)}개의 대화 기록을 불러왔습니다.")
+                    
+                    # 메모리 시스템에 기록 추가
+                    self._add_to_memory(self.conversation_history)
+            else:
+                self.conversation_history = []
+                logger.info("memory.json 파일이 없어 새로운 대화 기록을 시작합니다.")
+        except (json.JSONDecodeError, IOError) as e:
+            logger.error(f"기억 로드 실패: {e}")
+            self.conversation_history = []
+        except Exception as e:
+            logger.error(f"기억 로드 중 알 수 없는 오류: {e}")
+            self.conversation_history = []
+    
+    def _add_to_memory(self, messages):
+        """대화 기록을 메모리 시스템에 추가"""
+        for msg in messages:
+            if msg["role"] in ["user", "assistant"] and len(msg["content"]) > 10:
+                text = msg["content"]
+                self.memory_model.add_document(text)
+        logger.info(f"메모리 시스템에 {len(messages)}개 기록 추가 완료")
+
+    def save_memory(self):
+        """앱 종료 시 현재 대화 기록을 memory.json 파일에 저장합니다."""
+        logger.info("\n--- [메모리 저장 시작] ---")
+        try:
+            # 저장할 디렉토리 확인 및 생성
+            memory_dir = os.path.dirname(self.memory_path)
+            if not os.path.exists(memory_dir):
+                os.makedirs(memory_dir)
+                logger.info(f"디렉토리 생성: {memory_dir}")
+            
+            # 최근 50개 대화만 저장 (메모리 효율화)
+            history_to_save = self.conversation_history[-50:]
+            
+            if not history_to_save:
+                logger.info("저장할 대화 기록이 없습니다.")
+                return
+                
+            # 파일에 안전하게 저장
+            with open(self.memory_path, 'w', encoding='utf-8') as f:
+                json.dump(history_to_save, f, ensure_ascii=False, indent=4)
+                f.flush()  # 버퍼 비우기
+                os.fsync(f.fileno())  # 디스크에 동기화
+                
+            logger.info(f"성공: {len(history_to_save)}개 대화 기록 저장 완료")
+            
+        except Exception as e:
+            logger.error(f"!!! 메모리 저장 실패: {e} !!!")
+            # 오류 발생 시 최소한의 백업 시도
+            try:
+                backup_path = f"{self.memory_path}.bak"
+                with open(backup_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.conversation_history, f)
+                logger.info(f"백업 파일 생성: {backup_path}")
+            except Exception as backup_error:
+                logger.error(f"백업 생성 실패: {backup_error}")
+
+    def retrieve_memories(self, query, n_results=3):
+        """AI 임베딩 기반으로 관련 기억 검색"""
+        return self.memory_model.retrieve_similar(query, n_results)
+
+    def extract_user_facts(self, user_input, assistant_response):
+        """사용자 입력에서 개인 정보 추출 (API 호출 최소화)"""
+        # 간단한 패턴 매칭으로 기본 정보 추출 시도
+        patterns = {
+            "이름": r"내 이름은 (.+?)[\s\.]",
+            "나이": r"나는 (\d+)살이야",
+            "거주지": r"나는 (.+?)에 살아",
+            "직업": r"내 직업은 (.+?)[\s\.]"
+        }
+        
+        extracted = {}
+        for key, pattern in patterns.items():
+            match = re.search(pattern, user_input)
+            if match:
+                extracted[key] = match.group(1)
+        
+        # 추출된 정보가 있을 경우 반환
+        if extracted:
+            return {"personal_facts": extracted}
+        
+        # 정보가 없을 때만 API 호출
+        if not self.CONFIG.get("USE_API_FOR_MEMORY", False):
+            return {}
+            
+        prompt = (
+            "다음 대화에서 사용자에 대한 새로운 사실을 추출하세요. "
+            "JSON 형식으로 응답하고, 새로운 정보가 없으면 빈 객체를 반환하세요.\n\n"
+            f"사용자: {user_input}\n"
+            f"어시스턴트: {assistant_response}\n\n"
+            "예시: {\"personal_facts\": {\"거주지\": \"아산\"}, \"preferences\": {\"음식\": \"피자\"}}"
+        )
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.CONFIG["DEEPSEEK_MODEL"],
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                max_tokens=200
+            )
+            
+            facts = json.loads(response.choices[0].message.content)
+            return facts
+        except Exception as e:
+            logger.error(f"사용자 정보 추출 오류: {e}")
+            return {}
+
+    def analyze_command_logic(self, command_raw, is_follow_up=False):
+        # 0. 플러그인에서 명령 처리 시도
+        plugin_result = self.plugin_manager.handle_command(command_raw)
+        if plugin_result:
+            return plugin_result        
+        
+        # 1. 모호한 후속 질문 처리
+        follow_up_keywords = ["그 사람", "그거", "거기서", "저것도", "영어로도", "일본어로도", 
+                             "다시 한번", "자세히", "아니", "말고", "다른"]
+        is_ambiguous = any(keyword in command_raw for keyword in follow_up_keywords) or len(command_raw.split()) <= 3
+
+        # 후속 질문이고, 재귀 호출이 아닐 때만 문맥 추론 시도
+        if is_ambiguous and not is_follow_up and self.conversation_history:
+            logger.info("모호한 질문 감지. 문맥 추론을 시작합니다.")
+            
+            # 현재 브라우저 컨텍스트 포함
+            context_info = ""
+            with self.context_lock:
+                if self.conversation_context["active_tab"]["url"]:
+                    context_info = (
+                        f"\n[현재 브라우징 컨텍스트]\n"
+                        f"제목: {self.conversation_context['active_tab']['title']}\n"
+                        f"URL: {self.conversation_context['active_tab']['url']}\n"
+                    )
+            
+            # 최근 대화에서 마지막 사용자 명령과 어시스턴트 응답 추출
+            last_user_command = ""
+            last_assistant_response = ""
+            for msg in reversed(self.conversation_history):
+                if msg["role"] == "user":
+                    last_user_command = msg["content"]
+                    break
+                elif msg["role"] == "assistant":
+                    last_assistant_response = msg["content"]
+            
+            history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in self.conversation_history[-4:]])
+            prompt = (
+                f"다음은 사용자와의 최근 대화 내용입니다:{context_info}\n"
+                f"--- 대화 시작 ---\n{history_str}\n--- 대화 끝 ---\n\n"
+                f"이 문맥을 바탕으로, 사용자의 다음 모호한 요청을 완전한 명령어로 바꿔주세요.\n"
+                f"이전 사용자 명령: '{last_user_command}'\n"
+                f"이전 어시스턴트 응답: '{last_assistant_response}'\n"
+                f"현재 사용자의 모호한 요청: '{command_raw}'\n"
+                f"완성된 명령어:"
+            )
+            
+            completed_command = self.ask_ai([{"role": "user", "content": prompt}])
+            completed_command = completed_command.strip().strip('"').strip("'")
+            logger.info(f"추론된 명령어: {completed_command}")
+            if self.CONFIG.get("SHOW_SYSTEM_MESSAGES", False):
+                self.add_message("시스템", f"(추론된 명령어: {completed_command})", "status_tag")
+            
+            # 완성된 명령어로 재분석
+            return self.analyze_command_logic(completed_command, is_follow_up=True)
+
+        # --- 이하는 명확한 명령어 처리 로직 ---
+        lang_map = {'영어': 'English', '일본어': 'Japanese', '중국어': 'Chinese'}
+        platform_map = {'쿠팡': 'coupang', '유튜브': 'youtube', '네이버': 'naver', '구글': 'google'}
+
+        # 2. 플랫폼 + 번역 검색 패턴 (가장 구체적인 명령 먼저)
+        for platform_kw, platform_id in platform_map.items():
+            for lang_kw in lang_map.keys():
+                # 개선된 정규식: 검색어 부분을 더 정확히 추출
+                pattern = rf'{platform_kw}(에서|에)?\s*"?([^"]+?)"?\s*(?:를|을)?\s*{lang_kw}로\s*(검색|찾아줘|알려줘)'
+                match = re.search(pattern, command_raw)
+                if match:
+                    query = match.group(2).strip()
+                    query = re.sub(r'(이라고|라고|을|를)$', '', query).strip()
+                    return {'type': 'platform_translate_search', 'platform': platform_id, 'query': query, 'lang_ko': lang_kw, 'platform_kr': platform_kw}
+
+        # 3. 플랫폼 검색 패턴
+        for platform_kw, platform_id in platform_map.items():
+            pattern = rf'({platform_kw})(에서|에)?\s*"?([^"]+?)"?\s*(검색해줘|찾아줘|알려줘|검색해 줘|검색)'
+            match = re.search(pattern, command_raw)
+            if match:
+                query = match.group(3).strip()
+                query = re.sub(r'(이라고|라고|을|를)$', '', query).strip()
+                return {'type': 'platform_search', 'platform': platform_id, 'query': query, 'platform_kr': platform_kw}
+
+        # 4. 번역 검색 패턴
+        match = re.search(r'"?([^"]+)"?\s*(?:를|을)\s*(\S+어)로\s*(검색|찾아줘|알려줘)', command_raw)
+        if match:
+            query, lang_ko, _ = match.groups()
+            return {'type': 'translate_and_search', 'query': query.strip(), 'lang_ko': lang_ko, 'lang_en': lang_map[lang_ko]}
+
+        # 5. 날씨 조회 패턴 (추가)
+        #weather_patterns = [
+        #    r'(오늘|내일|모레)\s*날씨\s*(알려줘|어때|보여줘)',
+        #    r'(.*?)\s*날씨\s*(알려줘|어때|보여줘)'
+        #]
+        
+        #for pattern in weather_patterns:
+        #    match = re.search(pattern, command_raw)
+        #    if match:
+        #        forecast_type = match.group(1) if match.group(1) in ['오늘', '내일', '모레'] else '현재'
+        #        location = match.group(1) if pattern == weather_patterns[1] and match.group(1) and match.group(1) not in ['오늘', '내일', '모레'] else None
+        #        return {'type': 'weather', 'location': location, 'forecast': forecast_type}
+
+        # 6. 일반 명령어 패턴 (가장 긴 키워드 우선)
+        best_match = None
+        for key, info in self.COMMANDS.items():
+            if key.startswith("##"): continue
+            if 'aliases' in info:
+                for alias in info['aliases']:
+                    if alias in command_raw:
+                        if best_match is None or len(alias) > len(best_match['alias']):
+                            best_match = {'info': info, 'alias': alias}
+        if best_match:
+            return {'type': best_match['info'].get("action_type", "chat"), 'command_info': best_match['info']}
+
+        # 7. 종료 명령어
+        if any(kw in command_raw.lower() for kw in ["종료해", "수고했어", "잘가", "나가기"]): return {'type': 'exit'}
+        
+        # 8. 간단한 인사 처리 (API 호출 방지)
+        greetings = ["안녕", "안녕하세요", "하이", "반가워", "잘 지냈어", "뭐해"]
+        if any(greeting in command_raw for greeting in greetings):
+            return {'type': 'greeting'}
+
+        # 9. 일반 대화 (장기기억 연동)
+        system_prompt = (
+            "You are 'Alfred', a helpful and concise AI assistant. "
+            "Your primary response language is Korean. "
+            "Do not use emojis. Provide clear and direct answers. "
+            f"Current user: {self.CONFIG.get('USER_NAME', '사용자')}."
+        )
+        
+        # 사용자 프로필 정보 추가
+        profile_context = self.user_profile.get_context()
+        if profile_context:
+            system_prompt += f"\n\n{profile_context}"
+        
+        # 장기기억에서 관련 기억 검색
+        related_memories = self.retrieve_memories(command_raw)
+        if related_memories:
+            memory_context = "\n".join([f"관련 기억: {mem}" for mem in related_memories])
+            system_prompt += f"\n\n[과거 대화 기록]\n{memory_context}"
+            if self.CONFIG.get("SHOW_SYSTEM_MESSAGES", False):
+                self.add_message("기억 시스템", memory_context, "memory_tag")
+        
+        # 장기기억에서 최근 5개 + 전체 대화에서 최근 5개 조합
+        recent_history = self.conversation_history[-5:]
+        messages = [{"role": "system", "content": system_prompt}] + recent_history + [{"role": "user", "content": command_raw}]
+        return {'type': 'chat', 'messages': messages}
+
+    @timeout(15)  # 15초 타임아웃 적용
+    def process_command(self, command, is_internal=False):
+        # 스레드 추적 시작
+        tid = threading.get_ident()
+        self.active_threads[tid] = time.time()
+        
+        try:
+            if not is_internal:
+                self.conversation_history.append({"role": "user", "content": command})
+                self.gui_queue.put({'type': 'update_voice_button', 'text': "🤔", 'bg': "#607D8B"})
+            
+            plan = self.analyze_command_logic(command)
+            response_text = ""
+            action_type = plan.get('type')
+            
+            if action_type == 'platform_search':
+                platform = plan['platform']
+                query = plan['query']
+                platform_kr = plan['platform_kr']
+                url_templates = {
+                    'coupang': "https://www.coupang.com/np/search?q={query}",
+                    'youtube': "https://www.youtube.com/results?search_query={query}",
+                    'naver': "https://search.naver.com/search.naver?query={query}",
+                    'google': "https://www.google.com/search?q={query}"
+                }
+                if platform in url_templates:
+                    encoded_query = urllib.parse.quote(query)
+                    url = url_templates[platform].format(query=encoded_query)
+                    webbrowser.open(url)
+                    response_text = f"알겠습니다. {platform_kr}에서 '{query}'을(를) 검색합니다."
+                else:
+                    response_text = f"{platform_kr} 검색을 지원하지 않습니다."
+
+            elif action_type == 'platform_translate_search':
+                platform = plan['platform']
+                query = plan['query']
+                lang_ko = plan['lang_ko']
+                platform_kr = plan['platform_kr']
+                
+                lang_map = {'영어': 'English', '일본어': 'Japanese', '중국어': 'Chinese'}
+                lang_en = lang_map[lang_ko]
+                
+                if self.CONFIG.get("SHOW_SYSTEM_MESSAGES", False):
+                    self.add_message("알프레드", f"'{query}'를 {lang_ko}로 번역하여 {platform_kr}에서 검색합니다...", "status_tag")
+                
+                # 번역 수행 (구글 번역 API 사용)
+                try:
+                    params = {
+                        'q': query,
+                        'source': 'ko',
+                        'target': lang_en.lower(),
+                        'format': 'text'
+                    }
+                    response = requests.post('https://translation.googleapis.com/language/translate/v2', params=params, timeout=5)
+                    translated_query = response.json()['data']['translations'][0]['translatedText']
+                except Exception as e:
+                    logger.error(f"번역 실패: {e}, API 대체")
+                    # 실패 시 AI 번역
+                    translated_query = self.ask_ai([
+                        {"role": "user", "content": f"'{query}'를 {lang_en}로 번역해줘. 번역된 결과만 말해줘."}
+                    ])
+                
+                # 플랫폼 URL 생성 및 열기
+                url_templates = {
+                    'coupang': "https://www.coupang.com/np/search?q={query}",
+                    'youtube': "https://www.youtube.com/results?search_query={query}",
+                    'naver': "https://search.naver.com/search.naver?query={query}",
+                    'google': "https://www.google.com/search?q={query}"
+                }
+                
+                if platform in url_templates:
+                    encoded_query = urllib.parse.quote(translated_query)
+                    url = url_templates[platform].format(query=encoded_query)
+                    webbrowser.open(url)
+                    response_text = f"알겠습니다. {platform_kr}에서 '{translated_query}'을(를) 검색합니다."
+                else:
+                    response_text = f"{platform_kr} 검색을 지원하지 않습니다."
+
+            elif action_type == 'speak': 
+                response_text = plan['text']
+            elif action_type == 'chat': 
+                response_text = self.ask_ai(plan['messages'])
+            elif action_type in ['execute', 'terminate']: 
+                response_text = self.execute_command(plan['command_info'])
+            elif action_type == 'translate_and_search':
+                query, lang_ko, lang_en = plan.get('query'), plan.get('lang_ko'), plan.get('lang_en')
+                if self.CONFIG.get("SHOW_SYSTEM_MESSAGES", False):
+                    self.add_message("알프레드", f"'{query}'를 {lang_ko}로 번역하여 검색합니다...", "status_tag")
+                try:
+                    params = {
+                        'q': query,
+                        'source': 'ko',
+                        'target': lang_en.lower(),
+                        'format': 'text'
+                    }
+                    response = requests.post('https://translation.googleapis.com/language/translate/v2', params=params, timeout=5)
+                    translated_query = response.json()['data']['translations'][0]['translatedText']
+                except Exception as e:
+                    logger.error(f"번역 실패: {e}, API 대체")
+                    translated_query = self.ask_ai([
+                        {"role": "user", "content": f"'{query}'를 {lang_en}로 번역해줘. 번역된 결과만 말해줘."}
+                    ])
+                encoded_query = urllib.parse.quote(translated_query)
+                webbrowser.open(f"https://www.google.com/search?q={encoded_query}")
+                response_text = f"'{translated_query}'(으)로 검색을 실행합니다."
+            
+            elif action_type == 'exit':
+                response_text = "알겠습니다. 언제든지 다시 불러주세요."
+                self.add_message("알프레드", response_text, "assistant_tag")
+                self.speak(response_text, sync=True)
+                self.gui_queue.put({'type': 'exit'})
+                return
+            
+            elif action_type == 'greeting':
+                greetings = [
+                    f"안녕하세요, {self.CONFIG.get('USER_NAME', '사용자')}님! 무엇을 도와드릴까요?",
+                    f"반갑습니다! 오늘은 어떤 일을 도와드릴까요?",
+                    f"안녕하세요! 기쁘게 도와드리겠습니다."
+                ]
+                response_text = np.random.choice(greetings)
+            
+            elif action_type == 'weather':  # 날씨 조회 처리
+                location = plan.get('location')
+                forecast = plan.get('forecast', '현재')
+                
+                # 위치가 지정되지 않았으면 프로필에서 가져오기
+                if not location:
+                    location = self.user_profile.profile["personal_facts"].get("거주지", "서울")  # 기본값 서울
+                
+                # 위치에서 특별시/광역시만 추출 (예: "서울 강남구" -> "서울")
+                if ' ' in location:
+                    city = location.split()[0]
+                    # 주요 광역시 목록
+                    metropolitan_cities = ['서울', '부산', '대구', '인천', '광주', '대전', '울산']
+                    if city in metropolitan_cities:
+                        location = city
+                
+                # 날씨 API 호출
+                try:
+                    api_key = self.CONFIG.get("WEATHER_API_KEY")
+                    if not api_key:
+                        response_text = "⚠️ 날씨 API 키가 설정되지 않았습니다. config.json 파일을 확인해주세요."
+                    else:
+                        # 위치 정보 URL 인코딩
+                        encoded_location = urllib.parse.quote(location)
+                        
+                        # 현재 날씨 API 호출 (OpenWeatherMap)
+                        if forecast in ['현재', '오늘']:
+                            url = f"https://api.openweathermap.org/data/2.5/weather?q={encoded_location}&appid={api_key}&units=metric&lang=kr"
+                            response = requests.get(url, timeout=5)
+                            data = response.json()
+                            
+                            if response.status_code == 200:
+                                temp = data['main']['temp']
+                                desc = data['weather'][0]['description']
+                                humidity = data['main']['humidity']
+                                response_text = f"🌤️ {location}의 현재 날씨: {desc}, 온도: {temp}°C, 습도: {humidity}%"
+                            else:
+                                # 간소화된 오류 메시지
+                                response_text = f"⚠️ {location}의 날씨 정보를 가져오지 못했습니다"
+                                
+                        # 내일/모레 날씨 (기상청 단기예보 활용)
+                        elif forecast in ['내일', '모레']:
+                            # 간소화된 응답 (실제 서비스에서는 API 구현 필요)
+                            response_text = f"⛅ {location}의 {forecast} 날씨: 간편 정보 서비스 준비 중입니다"
+                            
+                except Exception as e:
+                    logger.error(f"날씨 API 오류: {str(e)}")
+                    response_text = f"⚠️ {location} 날씨 정보 요청 실패: {str(e)}"
+            
+            if response_text:
+                self.add_message("알프레드", response_text, "assistant_tag")
+                self.speak(response_text)
+                
+                # 대화 기록 저장
+                if not is_internal:
+                    self.conversation_history.append({"role": "assistant", "content": response_text})
+                
+                # 메모리 시스템에 저장
+                if not is_internal:
+                    try:
+                        self.memory_model.add_document(command)
+                        self.memory_model.add_document(response_text)
+                    except Exception as e:
+                        logger.error(f"메모리 시스템 저장 오류: {e}")
+                
+                # 사용자 정보 추출 및 업데이트 (키워드 기반)
+                if not is_internal and any(keyword in command for keyword in ["기억해", "저장해", "알아둬"]):
+                    new_facts = self.extract_user_facts(command, response_text)
+                    if new_facts and any(new_facts.values()):
+                        self.user_profile.update_profile(new_facts)
+                        if self.CONFIG.get("SHOW_SYSTEM_MESSAGES", False):
+                            self.add_message("프로필 시스템", "사용자 정보가 업데이트되었습니다", "memory_tag")
+                
+                # 메모리 관리: 최대 100개 대화 유지
+                if len(self.conversation_history) > 100:
+                    self.conversation_history = self.conversation_history[-100:]
+                    
+                # 10개마다 자동 저장 (데이터 손실 방지)
+                if len(self.conversation_history) % 10 == 0:
+                    threading.Thread(target=self.save_memory, daemon=True).start()
+        
+        finally:
+            # 스레드 추적 제거
+            if tid in self.active_threads:
+                del self.active_threads[tid]
+
+    def close_app(self):
+        """앱 종료 처리 - 메모리 저장 후 안전하게 종료"""
+        logger.info("\n=== 애플리케이션 종료 시작 ===")
+        
+        # 메모리 저장 (동기식으로 완료 보장)
+        self.save_memory()
+        
+        # 사용자 프로필 저장
+        self.user_profile.save_profile()
+        
+        # 실행 플래그 변경
+        self.running = False
+        
+        # 음성 출력 중지
+        pygame.mixer.music.stop()
+        
+        # GUI 종료
+        self.destroy()
+        
+        # Pygame 종료
+        pygame.mixer.quit()
+        logger.info("=== 안전하게 종료되었습니다 ===")
+
+    def send_command(self, event=None):
+        command = self.input_field.get().strip()
+        if command:
+            self.add_message(f"{self.CONFIG.get('USER_NAME', '사용자')}", command, "user_tag")
+            self.input_field.delete(0, tk.END)
+            threading.Thread(target=self.process_command, args=(command,), daemon=True).start()
+
+    def speak(self, text, sync=False):
+        if not text: return
+        text = re.sub(r'\*\*', '', text)
+        logger.info(f"🔊 알프레드: {text}")
+        self.is_speaking.set()
+        def tts_task():
+            try: asyncio.run(self._speak_async(text))
+            finally: 
+                self.is_speaking.clear()
+                if self.is_listening and self.CONFIG.get("SHOW_SYSTEM_MESSAGES", False):
+                    self.gui_queue.put({'type': 'update_voice_button', 'text': "🎤...", 'bg': "#FFC107"})
+                    self.gui_queue.put({'type': 'add_message', 'sender': '시스템', 'text': '듣고 있습니다...', 'tag': 'status_tag'})
+        tts_thread = threading.Thread(target=tts_task, daemon=True)
+        tts_thread.start()
+        if sync: tts_thread.join()
+
+    async def _speak_async(self, text):
+        try:
+            communicate = edge_tts.Communicate(text, self.VOICE, rate=self.RATE)
+            audio_bytes = b""
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio": audio_bytes += chunk["data"]
+            if not audio_bytes: return
+            
+            # Pygame 버퍼 문제 해결
+            with io.BytesIO() as audio_stream:
+                audio_stream.write(audio_bytes)
+                audio_stream.seek(0)
+                try:
+                    pygame.mixer.music.load(audio_stream)
+                    pygame.mixer.music.play()
+                    while pygame.mixer.music.get_busy(): 
+                        await asyncio.sleep(0.1)
+                except pygame.error as e:
+                    logger.error(f"Pygame 음성 재생 오류: {e}")
+        except Exception as e: 
+            logger.error(f"비동기 음성 처리 중 오류: {e}")
+
+    def ask_ai(self, messages):
+        try:
+            # 일반 응답 방식으로 변경 (스트리밍 제거)
+            response = self.client.chat.completions.create(
+                model=self.CONFIG["DEEPSEEK_MODEL"],
+                messages=messages,
+                timeout=10,  # 타임아웃 단축
+                max_tokens=500
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"AI API 통신 오류: {e}")
+            return "⚠️ 응답 생성에 실패했습니다. 다시 시도해 주세요."
+
+    def execute_command(self, command_info):
+        cmd = command_info.get(platform.system().lower(), command_info.get("windows"))
+        if cmd:
+            try:
+                if isinstance(cmd, list): subprocess.Popen(cmd)
+                else: subprocess.Popen(cmd, shell=True)
+                return self.get_response_text(command_info)
+            except Exception as e: return f"명령 실행 중 오류: {e}"
+        return "이 운영체제에서는 지원되지 않는 명령어입니다."
+
+    def get_response_text(self, command_info):
+        target = command_info.get('target_name', '')
+        action_type = command_info.get('action_type')
+        verb_map = {
+            'execute': '실행하겠습니다', 'terminate': '종료하겠습니다',
+            'open_file': '열겠습니다', 'empty': '비우겠습니다'
+        }
+        action_verb = verb_map.get(action_type, '수행하겠습니다')
+        if not target: return f"알겠습니다. 요청하신 작업을 {action_verb}."
+        last_char = target[-1]
+        josa = "을" if '가' <= last_char <= '힣' and (ord(last_char) - ord('가')) % 28 > 0 else "를"
+        return f"알겠습니다. {target}{josa} {action_verb}."
+    
+    def stop_speech(self):
+        pygame.mixer.music.stop()
+        self.is_speaking.clear()
+        if self.CONFIG.get("SHOW_SYSTEM_MESSAGES", False):
+            self.add_message("시스템", "음성 출력을 중단했습니다.", "status_tag")
+
+    def initial_greeting(self):
+        # 직접 인사말 생성하여 출력 (process_command 거치지 않음)
+        greetings = [
+            f"안녕하세요, {self.CONFIG.get('USER_NAME', '사용자')}님! 무엇을 도와드릴까요?",
+            f"반갑습니다! 오늘은 어떤 일을 도와드릴까요?",
+            f"안녕하세요! 기쁘게 도와드리겠습니다."
+        ]
+        response_text = np.random.choice(greetings)
+        self.add_message("알프레드", response_text, "assistant_tag")
+        self.speak(response_text)
+
+    def add_message(self, sender, message, tag):
+        self.gui_queue.put({'type': 'add_message', 'sender': sender, 'text': message, 'tag': tag})
+        
+    def _add_message_from_queue(self, sender, message, tag):
+        self.output_area.config(state=tk.NORMAL)
+        self.output_area.insert(tk.END, f"{sender}: ", tag)
+        self.output_area.insert(tk.END, f"{message}\n\n")
+        self.output_area.config(state=tk.DISABLED)
+        self.output_area.see(tk.END)
+
+    def check_gui_queue(self):
+        try:
+            while True:
+                task = self.gui_queue.get_nowait()
+                if task['type'] == 'add_message':
+                    self._add_message_from_queue(task['sender'], task['text'], task['tag'])
+                elif task['type'] == 'update_voice_button':
+                    self.voice_button.config(text=task['text'], bg=task['bg'])
+                elif task['type'] == 'exit':
+                    self.close_app()
+        except queue.Empty: pass
+        finally:
+            if self.running: self.after(100, self.check_gui_queue)
+
+    def toggle_voice_input(self):
+        self.is_listening = not self.is_listening
+        if self.is_listening:
+            self.gui_queue.put({'type': 'update_voice_button', 'text': "🎤...", 'bg': "#FFC107"})
+            if self.CONFIG.get("SHOW_SYSTEM_MESSAGES", False):
+                self.add_message("시스템", "듣고 있습니다...", "status_tag")
+        else:
+            self.gui_queue.put({'type': 'update_voice_button', 'text': "🎤", 'bg': "#4CAF50"})
+            if self.CONFIG.get("SHOW_SYSTEM_MESSAGES", False):
+                self.add_message("시스템", "음성 인식을 중단했습니다.", "status_tag")
+    
+    def voice_input_worker(self):
+        r = sr.Recognizer()
+        r.energy_threshold = 4000
+        r.dynamic_energy_threshold = True
+        r.dynamic_energy_adjustment_damping = 0.15
+        r.dynamic_energy_ratio = 1.5
+        r.pause_threshold = 1.0  # 감지 대기 시간 단축
+        
+        while self.running:
+            if not self.is_listening or self.is_speaking.is_set():
+                time.sleep(0.1)
+                continue
+            
+            try:
+                with sr.Microphone() as source:
+                    logger.info("음성 인식을 위해 마이크를 초기화합니다...")
+                    r.adjust_for_ambient_noise(source, duration=0.5)
+                    logger.info(f"음성 인식 대기 중... 에너지 임계값: {r.energy_threshold:.2f}")
+                    
+                    try:
+                        audio = r.listen(source, timeout=3, phrase_time_limit=5)
+                    except sr.WaitTimeoutError:
+                        continue
+                    
+                    try:
+                        # 오프라인 음성 인식 (Vosk) 사용
+                        text = r.recognize_google(audio, language='ko-KR').strip()
+                        text = re.sub(r'\b(음|음음|음\.)\b', '', text).strip()
+                        
+                        if text:
+                            self.add_message(f"{self.CONFIG.get('USER_NAME', '사용자')}", text, "user_tag")
+                            threading.Thread(target=self.process_command, args=(text,), daemon=True).start()
+                    except sr.UnknownValueError:
+                        if self.CONFIG.get("SHOW_SYSTEM_MESSAGES", False):
+                            self.add_message("시스템", "음성을 인식하지 못했습니다", "status_tag")
+                    except sr.RequestError as e:
+                        logger.error(f"음성 인식 서비스 오류: {e}")
+                        self.gui_queue.put({'type': 'add_message', 'sender': '시스템', 'text': f'음성 서비스 오류: {e}', 'tag': 'status_tag'})
+                        time.sleep(2)
+                    
+            except OSError as e:
+                logger.error(f"마이크 오류: {e}, 재시도 중...")
+                time.sleep(3)  # 오류 시 긴 대기 시간
+            except Exception as e:
+                logger.error(f"음성 인식 루프 오류: {e}")
+                self.is_listening = False
+                self.gui_queue.put({'type': 'update_voice_button', 'text': "🎤", 'bg': "#4CAF50"})
+                time.sleep(5)  # 심각한 오류 시 긴 대기
+
+    def monitor_active_tab(self):
+        if not pythoncom or platform.system() != 'Windows': 
+            return
+            
+        pythoncom.CoInitialize()
+        chrome_control = auto.Control(ClassName='Chrome_WidgetWin_1')
+        
+        while self.running:
+            try:
+                time.sleep(1)
+                hwnd = win32gui.GetForegroundWindow()
+                window_title = win32gui.GetWindowText(hwnd)
+                url = None
+                
+                if "Chrome" in window_title or "Edge" in window_title:
+                    try:
+                        pane = chrome_control.PaneControl(Name=window_title)
+                        address_bar = pane.EditControl(Name="주소 및 검색창")
+                        
+                        if not address_bar.Exists(0.5, 0.5):
+                            address_bar = pane.EditControl(Name="Address and search bar")
+                        
+                        if address_bar.Exists(0.5, 0.5):
+                            url = address_bar.GetValuePattern().Value
+                    except Exception:
+                        continue
+                else: 
+                    continue
+                    
+                if url:
+                    with self.context_lock:
+                        self.conversation_context["active_tab"] = {
+                            "title": window_title, 
+                            "url": url
+                        }
+            except Exception as e:
+                logger.error(f"탭 모니터링 오류: {e}")
+                
+        pythoncom.CoUninitialize()
+
+if __name__ == "__main__":
+    try:
+        app = App()
+        app.mainloop()
+    except Exception as e:
+        logger.critical(f"애플리케이션 실행 중 심각한 오류 발생: {e}")
+    finally:
+        sys.exit(0)
