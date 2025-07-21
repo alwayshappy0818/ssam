@@ -1,0 +1,122 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+
+def segment_motor_components(image_path):
+    """
+    모터 엣지 이미지를 기반으로 Shaft, Rotor, Magnet, Stator, Coil, Air 영역을 분할합니다.
+
+    Args:
+        image_path (str): 분석할 모터 이미지 파일 경로
+    """
+    image = cv2.imread(image_path)
+    if image is None:
+        print(f"오류: 이미지를 로드할 수 없습니다. 경로를 확인하세요: {image_path}")
+        return
+
+    output_image = image.copy()
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    height, width = gray.shape
+    center = (width // 2, height // 2)
+
+    _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+
+    contours, hierarchy = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    contour_info = []
+    for i, cnt in enumerate(contours):
+        if cv2.contourArea(cnt) > 10: 
+            distances = np.sqrt(np.sum((cnt - center)**2, axis=2))
+            avg_radius = np.mean(distances)
+            contour_info.append({'contour': cnt, 'radius': avg_radius, 'hierarchy': hierarchy[0][i]})
+
+    contour_info.sort(key=lambda c: c['radius'])
+    unique_radii = []
+    if contour_info:
+        last_radius = contour_info[0]['radius']
+        unique_radii.append(last_radius)
+        for info in contour_info:
+            if abs(info['radius'] - last_radius) > 5:
+                unique_radii.append(info['radius'])
+                last_radius = info['radius']
+
+    print("="*30)
+    print(f"이미지 '{image_path.split('/')[-1]}' 분석 결과")
+    print(f"검출된 주요 경계선 (중심으로부터의 거리):")
+    for i, r in enumerate(unique_radii):
+        print(f"  경계선 {i+1}: {r:.2f} 픽셀")
+    print("="*30)
+
+    colors = {
+        "Shaft": (255, 0, 0),      # 파랑
+        "Rotor": (0, 255, 0),      # 초록
+        "Magnet": (0, 255, 255),   # 노랑
+        "Stator": (0, 0, 255),     # 빨강
+        "Coil": (255, 0, 255),     # 마젠타
+        "Air": (255, 255, 255)     # 흰색
+    }
+
+    mask = np.zeros((height + 2, width + 2), np.uint8)
+
+    cv2.floodFill(output_image, mask, center, colors["Shaft"])
+
+    if len(unique_radii) >= 3:
+        r_rotor = (unique_radii[1] + unique_radii[2]) / 2
+
+        seed_point_rotor = (int(center[0] + r_rotor), center[1])
+        if all(output_image[seed_point_rotor[1], seed_point_rotor[0]] == [255, 255, 255]):
+             cv2.floodFill(output_image, mask, seed_point_rotor, colors["Rotor"])
+
+    if len(unique_radii) >= 6:
+
+        r_magnet = (unique_radii[3] + unique_radii[4]) / 2
+        for angle in [45, -45, 135, -135]: 
+            rad = math.radians(angle)
+            seed_x = int(center[0] + r_magnet * math.cos(rad))
+            seed_y = int(center[1] + r_magnet * math.sin(rad))
+            if all(output_image[seed_y, seed_x] == [255, 255, 255]):
+                cv2.floodFill(output_image, mask, (seed_x, seed_y), colors["Magnet"])
+
+    if len(unique_radii) >= 8:
+        r_stator_back_iron = (unique_radii[6] + unique_radii[-1]) / 2
+
+        seed_point_stator = (int(center[0] + r_stator_back_iron), center[1])
+        if all(output_image[seed_point_stator[1], seed_point_stator[0]] == [255, 255, 255]):
+            cv2.floodFill(output_image, mask, seed_point_stator, colors["Stator"])
+
+        num_coils = 12
+        r_coil = (unique_radii[6] + unique_radii[-2]) / 2  # 코일의 대략적인 반지름
+        for i in range(num_coils):
+            angle = (360 / num_coils) * i + (360 / num_coils / 2) 
+            rad = math.radians(angle)
+            seed_x = int(center[0] + r_coil * math.cos(rad))
+            seed_y = int(center[1] + r_coil * math.sin(rad))
+
+            if all(output_image[seed_y, seed_x] == [255, 255, 255]):
+                cv2.floodFill(output_image, mask, (seed_x, seed_y), colors["Coil"])
+
+    plt.style.use('default')
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+
+    axes[0].imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    axes[0].set_title("Original Edge Image")
+    axes[0].axis('off')
+
+    axes[1].imshow(cv2.cvtColor(output_image, cv2.COLOR_BGR2RGB))
+    axes[1].set_title("Segmented Components")
+    axes[1].axis('off')
+
+    patches = [plt.Rectangle((0, 0), 1, 1, color=[c/255 for c in reversed(v)]) for k, v in colors.items()]
+    labels = list(colors.keys())
+    fig.legend(patches, labels, loc='lower center', ncol=len(colors), bbox_to_anchor=(0.5, -0.01))
+
+    plt.tight_layout(rect=[0, 0.05, 1, 1])
+    plt.show()
+
+
+if __name__ == '__main__':
+
+    image_file = 'D:/o5utput/screenshot 2025-06-26 93 (1).png'
+'
+    segment_motor_components(image_file)
