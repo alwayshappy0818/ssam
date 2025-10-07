@@ -9,14 +9,13 @@ from skimage.measure import find_contours
 from segment_anything import sam_model_registry, SamPredictor # SamPredictor도 여기서 import 필요
 
 # --- Setting (설정) ---
-sam_checkpoint = "D:/sam_vit_h_4b8939.pth" # SAM 모델 파일 경로 (필수 확인)
-model_type = "vit_h" # 모델 타입 (sam_checkpoint와 일치해야 함)
+sam_checkpoint = "D:/sam_vit_h_4b8939.pth" # 모델경로 정확하게 맞춰야 함
+model_type = "vit_h" # 모델타입도 정확히 일치해야 함.
 
-# Device 설정: CUDA (GPU) 사용 가능하면 'cuda', 아니면 'cpu'
+#엔비디아 gpu면 cuda, 아니면 cpu
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
-# 결과 이미지 및 JSON 저장 폴더 생성 (없으면 생성)
 results_dir = "results"
 os.makedirs(results_dir, exist_ok=True)
 
@@ -39,7 +38,7 @@ class SAMInteractiveSegmenter:
         self.input_labels = []
         self.input_boxes = []
         
-        # COCO 어노테이션 ID 관리를 위한 카운터 (한 세션 내에서 유니크하게 유지)
+        # COCO 어노테이션 ID 관리를 위한 카운터 (한 세션 내에서 멋드러지고 간지나게 유지)
         self.global_annotation_id_counter = 0 
         self.image_id_counter = 1 # COCO image_id는 1부터 시작하는 것이 일반적
 
@@ -47,7 +46,7 @@ class SAMInteractiveSegmenter:
         """SAM 모델을 로드합니다."""
         print('Loading Segment Anything Model...')
         try:
-            # from segment_anything import sam_model_registry, SamPredictor # 이미 상단에서 import
+            # from segment_anything import sam_model_registry, SamPredictor # 이미 상단에서 import했음음
             sam = sam_model_registry[self.model_type](checkpoint=self.sam_checkpoint)
             sam.to(device=self.device)
             self.predictor = SamPredictor(sam)
@@ -92,12 +91,7 @@ class SAMInteractiveSegmenter:
         contours = find_contours(mask, 0.5) # 0.5는 이진 마스크의 임계값
         coco_polygons = []
         for contour in contours:
-            # (y, x) -> (x, y)로 변환 후 평탄화
-            # np.flip(contour, axis=1)은 (y,x)를 (x,y)로 바꿈
-            # .ravel()로 1차원 배열로 평탄화
-            # .tolist()로 파이썬 리스트로 변환
             segmentation = np.flip(contour, axis=1).ravel().tolist()
-            # COCO 폴리곤은 최소 3개 점 (6개 좌표) 이상이어야 유효
             if len(segmentation) >= 6:
                 coco_polygons.append(segmentation)
         return coco_polygons
@@ -180,16 +174,15 @@ class SAMInteractiveSegmenter:
             "licenses": [],
             "images": [],
             "annotations": [],
-            "categories": [{"id": 1, "name": "object", "supercategory": "none"}] # 기본 카테고리 ID를 1로 설정 (일반적)
+            "categories": [{"id": 1, "name": "object", "supercategory": "none"}] # 기본 카테고리 ID를 1로 설정
         }
 
-        # 이미지 정보 추가
         image_info = {
             "id": self.image_id_counter,
             "width": img_width,
             "height": img_height,
             "file_name": filename,
-            "license": 0, # 라이선스 ID (필요시 정의)
+            "license": 0, # 라이선스 ID있으면 넣기기
             "date_captured": current_time
         }
         coco_data["images"].append(image_info)
@@ -206,7 +199,7 @@ class SAMInteractiveSegmenter:
             # COCO 형식 폴리곤 추출
             coco_segmentation = self._extract_coco_polygon_from_mask(mask_np)
             
-            if not coco_segmentation: # 유효한 폴리곤이 없으면 건너뜀
+            if not coco_segmentation: # 유효한 폴리곤이 없으면 건너뛰어버리기기
                 continue
 
             # COCO 형식 bbox 계산 (마스크로부터 직접 계산)
@@ -225,7 +218,7 @@ class SAMInteractiveSegmenter:
             coco_data["annotations"].append(annotation)
             self.global_annotation_id_counter += 1
 
-        # 원본 입력 프롬프트 시각화 (선택 사항)
+        # 원본 입력 프롬프트 시각화할지 말지 아래에서 선택하면ㄷ ㅗㅣㅁ.
         if input_data:
             if input_data.get('input_boxes') and len(input_data['input_boxes']) > 0:
                 for box_coords in input_data['input_boxes']:
