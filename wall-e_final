@@ -1,0 +1,628 @@
+import sys
+import os
+import cv2
+import numpy as np
+import time
+import threading
+import serial
+import math
+from ctypes import *
+from contextlib import contextmanager
+import platform
+import subprocess
+import datetime 
+
+# [중요] 시스템 패키지 경로 추가
+sys.path.append('/usr/lib/python3/dist-packages')
+
+# 1. 필수 라이브러리 로드
+try:
+    import speech_recognition as sr
+    import ollama
+    from gtts import gTTS
+    import yaml
+    import pyaudio
+    
+    # 비전 라이브러리
+    from ai_edge_litert.interpreter import Interpreter
+    from picamera2 import Picamera2
+    try:
+        from libcamera import controls
+    except ImportError:
+        controls = None
+
+except ImportError as e:
+    print(f"\n[오류] 필수 라이브러리 로드 실패: {e}")
+    sys.exit(1)
+
+# ==========================================
+# [설정]
+SERIAL_PORT = '/dev/ttyACM0' 
+BAUD_RATE = 115200
+
+# [마이크 설정]
+MIC_DEVICE_INDEX = None 
+COMMANDS_FILE = "commands.yaml"
+PROFILE_FILE = "user_profile.yaml"
+
+# [AI 모델 설정]
+MODEL_PATH = "/home/yorce23/Downloads/1230_best_float16.tflite"
+CLASSES = ["Face", "Hand", "Person"] 
+CONF_THRESHOLD = 0.5
+LLM_MODEL = "qwen2.5:3b"
+
+# [음악 설정]
+MUSIC_DIR = "/home/yorce23/Desktop/music"
+
+# [목소리 설정]
+VOICE_KO = "ko-KR-SunHiNeural"   
+VOICE_EN = "en-US-AnaNeural"     
+VOICE_JP = "ja-JP-KeitaNeural"   
+
+# ==========================================
+# [전역 변수]
+current_person_count = 0  
+arduino_ser = None        
+running = True            
+is_llm_processing = False  # 생각 중일 때 비전 일시정지용
+is_speaking = False        # [추가] 말하는 중일 때 마이크 차단용
+music_mode = False         
+music_list = []            
+music_process = None       
+# ==========================================
+
+# --- C 레벨 에러 로그 차단 ---
+@contextmanager
+def ignore_stderr():
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    old_stderr = os.dup(2)
+    sys.stderr.flush()
+    try:
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        os.dup2(old_stderr, 2)
+        os.close(devnull)
+        os.close(old_stderr)
+
+def load_commands():
+    if not os.path.exists(COMMANDS_FILE):
+        return []
+    try:
+        with open(COMMANDS_FILE, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+            return data.get('commands', [])
+    except Exception as e:
+        print(f"[오류] 명령어 파일 로드 실패: {e}")
+        return []
+
+def load_user_profile():
+    if not os.path.exists(PROFILE_FILE):
+        return "사용자 정보 없음."
+    try:
+        with open(PROFILE_FILE, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+            p = data.get('profile', {})
+            
+            info_text = f"""
+            [사용자 정보]
+            이름: {p.get('name', '사용자')}
+            나이: {p.get('age', '알 수 없음')}
+            건강 상태: {', '.join(p.get('health', []))}
+            좋아하는 것: {', '.join(p.get('likes', []))}
+            주요 일정: {', '.join(p.get('schedule', []))}
+            메모: {p.get('memo', '없음')}
+            """
+            return info_text
+    except Exception as e:
+        print(f"[오류] 프로필 로드 실패: {e}")
+        return "사용자 정보 로드 실패."
+
+# --- [강력 수정] 오디오 볼륨 강제 고정 ---
+def setup_audio_volume():
+    print("[시스템] 오디오 볼륨 강제 설정 (wm8960)...")
+    
+    # wm8960soundcard라는 이름의 카드를 찾아서 설정
+    target_card = "-D hw:wm8960soundcard"
+    
+    # 가능한 모든 볼륨 컨트롤을 100%로 올리는 명령어 리스트
+    commands = [
+        # 1. Playback (가장 중요)
+        f"amixer {target_card} sset 'Playback' 100% unmute",
+        f"amixer {target_card} sset 'Headphone Playback' 100% unmute",
+        f"amixer {target_card} sset 'Speaker Playback' 100% unmute",
+        
+        # 2. PCM/Master (혹시 이름이 다를 경우 대비)
+        f"amixer {target_card} sset 'PCM' 100% unmute",
+        f"amixer {target_card} sset 'Master' 100% unmute",
+        
+        # 3. Output Mixer (경로 설정)
+        f"amixer {target_card} sset 'Left Output Mixer PCM' on",
+        f"amixer {target_card} sset 'Right Output Mixer PCM' on",
+        
+        # 4. Speaker/Headphone (출력단)
+        f"amixer {target_card} sset 'Speaker' 100% unmute",
+        f"amixer {target_card} sset 'Headphone' 100% unmute",
+        
+        # 5. Capture (마이크)
+        f"amixer {target_card} sset 'Capture' 100% unmute",
+        f"amixer {target_card} sset 'ADC PCM' 100% unmute",
+        f"amixer {target_card} sset 'Digital' 95% unmute",
+        
+        # 6. 효과 끄기
+        f"amixer {target_card} sset '3D' 0",
+        f"amixer {target_card} sset 'ALC' off"
+    ]
+    
+    for cmd in commands:
+        os.system(cmd + " > /dev/null 2>&1")
+    
+    print("[시스템] 볼륨 설정 완료 (100%).")
+
+# --- 음악 파일 스캔 ---
+def scan_music_files():
+    global music_list
+    if not os.path.exists(MUSIC_DIR):
+        print(f"[경고] 음악 폴더가 없습니다: {MUSIC_DIR}")
+        return
+    
+    music_list = [f for f in os.listdir(MUSIC_DIR) if f.lower().endswith('.mp3')]
+    print(f"[시스템] 음악 파일 {len(music_list)}개를 로드했습니다.")
+
+# --- 음악 재생 로직 ---
+def play_music_by_keyword(keyword):
+    global music_process, music_mode
+    
+    target_file = None
+    for fname in music_list:
+        if keyword.replace(" ", "") in fname.replace(" ", ""):
+            target_file = fname
+            break
+    
+    if target_file:
+        full_path = os.path.join(MUSIC_DIR, target_file)
+        print(f"[음악] 재생 시작: {target_file}")
+        speak(f"{target_file[:-4]}를 재생합니다.") 
+        
+        if music_process and music_process.poll() is None:
+            try: music_process.kill()
+            except: pass
+            
+        try:
+            # mplayer로 백그라운드 재생 (-volume 100)
+            music_process = subprocess.Popen(
+                ["mplayer", "-volume", "100", "-really-quiet", full_path],
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.DEVNULL
+            )
+        except Exception as e:
+            print(f"[오류] 재생 실패: {e}")
+            speak("재생에 실패했습니다.")
+            
+        music_mode = False 
+    else:
+        speak("찾는 음악이 없습니다. 다시 말씀해 주세요.")
+
+def init_serial():
+    global arduino_ser
+    try:
+        print(f"[시스템] 아두이노({SERIAL_PORT}) 연결 시도...", end=" ")
+        arduino_ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+        time.sleep(2) 
+        print("성공! (대기 모드)")
+    except Exception as e:
+        print(f"\n[경고] 아두이노 연결 실패: {e}")
+
+def send_command(cmd, v1=0, v2=0):
+    global arduino_ser
+    if arduino_ser and arduino_ser.is_open:
+        msg = f"<{cmd},{v1},{v2}>"
+        try:
+            arduino_ser.write(msg.encode())
+        except: pass
+
+def detect_language(text):
+    if any("\uAC00" <= c <= "\uD7A3" for c in text): return 'ko'
+    if any("\u3040" <= c <= "\u30FF" for c in text): return 'ja'
+    return 'en'
+
+# --- [수정] 말하기 함수 (마이크 차단 기능 포함) ---
+def speak(text):
+    global is_speaking
+    if not text: return
+    
+    # 말하기 시작: 마이크 차단
+    is_speaking = True
+    
+    lang_code = detect_language(text)
+    selected_voice = VOICE_EN
+    if lang_code == 'ko': selected_voice = VOICE_KO
+    elif lang_code == 'ja': selected_voice = VOICE_JP
+    
+    print(f"[TTS] {text} (Voice: {selected_voice})")
+    
+    filename = "temp_voice.mp3"
+    
+    edge_tts_path = "/home/yorce23/.local/bin/edge-tts"
+    if not os.path.exists(edge_tts_path):
+        edge_tts_path = "edge-tts" 
+
+    command = [
+        edge_tts_path,
+        "--text", text,
+        "--write-media", filename,
+        "--voice", selected_voice,
+        "--rate=+10%", 
+        "--pitch=+0Hz"
+    ]
+    
+    try:
+        subprocess.run(command, check=True)
+        subprocess.run(["mplayer", "-volume", "100", "-speed", "1.3", "-really-quiet", filename], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"[TTS 오류] {e}")
+    finally:
+        time.sleep(0.5)
+        # 말하기 종료: 마이크 재개
+        is_speaking = False
+
+# --- 마이크 자동 찾기 ---
+def find_microphone():
+    print("[오디오] 마이크 장치 검색 중...")
+    priority_keywords = ["wm8960", "seeed", "usb"]
+    try:
+        mic_list = sr.Microphone.list_microphone_names()
+        for priority in priority_keywords:
+            for index, name in enumerate(mic_list):
+                if priority in name.lower():
+                    print(f"  -> 발견({priority}): [{index}] {name}")
+                    return index
+        return 1
+    except:
+        return 1
+
+# --- 음성 인식 및 AI 스레드 ---
+def audio_thread_func():
+    global running, current_person_count, is_llm_processing, is_speaking, music_mode, music_process
+    
+    # [핵심] 스레드 시작 시 볼륨 재설정
+    time.sleep(2) 
+    setup_audio_volume()
+
+    commands_list = load_commands()
+    user_profile_text = load_user_profile()
+    scan_music_files()
+    
+    print(f"[시스템] {len(commands_list)}개의 명령어 로드 완료.")
+    
+    recognizer = sr.Recognizer()
+    recognizer.dynamic_energy_threshold = False
+    recognizer.energy_threshold = 300 
+    recognizer.pause_threshold = 0.4
+    recognizer.phrase_threshold = 0.3
+    recognizer.non_speaking_duration = 0.3
+
+    try:
+        mic = sr.Microphone(device_index=MIC_DEVICE_INDEX, sample_rate=None, chunk_size=2048)
+    except Exception as e:
+        print(f"\n[오류] 마이크 초기화 실패: {e}")
+        return
+
+    print(f"[오디오] 마이크 연결됨. (명령 대기)")
+
+    BASE_SYSTEM_PROMPT = f"""
+    당신은 반려 로봇 '월-이(Wall-E)'입니다. 
+    아래 [사용자 정보]를 기억하고, 가족처럼 대화하세요.
+    {user_profile_text}
+    규칙:
+    1. 답변은 1~2문장으로 짧게(30자 이내) 하세요.
+    2. 딱딱한 말투와 다정한 말투를 섞어쓰세요.
+    3. 사용자가 영어나 일본어로 말하면, 해당 언어로 대답하세요.
+    """
+    chat_history = []
+    MAX_HISTORY = 10
+
+    try:
+        with ignore_stderr():
+            with mic as source:
+                recognizer.adjust_for_ambient_noise(source, duration=1)
+                
+                while running:
+                    # 생각 중일 때 듣지 않음
+                    if is_llm_processing:
+                        time.sleep(0.1)
+                        continue
+
+                    # [핵심] 말하는 중일 때 듣지 않음 (자기 목소리 차단)
+                    if is_speaking:
+                        time.sleep(0.1)
+                        continue
+
+                    # 음악 재생 중이면 감도를 1000으로 높여서 음악을 '잡음' 취급
+                    if music_process and music_process.poll() is None:
+                        recognizer.energy_threshold = 1000
+                    else:
+                        recognizer.energy_threshold = 300
+
+                    audio = None
+                    text = None
+                    
+                    try:
+                        limit = 3 if (music_process and music_process.poll() is None) else 5
+                        audio = recognizer.listen(source, timeout=1, phrase_time_limit=limit)
+                    except sr.WaitTimeoutError:
+                        continue 
+                    except Exception:
+                        continue
+
+                    if audio:
+                        try:
+                            # 1. 소프트웨어 증폭
+                            raw_data = audio.get_raw_data(convert_rate=16000, convert_width=2)
+                            audio_np = np.frombuffer(raw_data, dtype=np.int16)
+                            audio_np = np.clip(audio_np * 2.0, -32768, 32767).astype(np.int16)
+                            amplified_audio = sr.AudioData(audio_np.tobytes(), 16000, 2)
+                            
+                            text = recognizer.recognize_google(amplified_audio, language='ko-KR')
+                            print(f"\n▶ 사용자: \"{text}\"")
+                        except sr.UnknownValueError:
+                            pass 
+                        except sr.RequestError:
+                            print("\n[!] 인터넷 연결 확인")
+
+                    if not text: continue
+                    clean_text = text.replace(" ", "")
+
+                    # --- 명령어 처리 ---
+                    if any(x in clean_text for x in ["음악꺼", "노래꺼", "시끄러", "조용히", "닥쳐", "멈춰", "그만"]):
+                        if music_process and music_process.poll() is None:
+                            music_process.kill()
+                            music_process = None
+                            print("[음악] 정지 명령 수신 -> 종료")
+                            speak("음악을 끕니다.")
+                            continue
+
+                    if music_mode:
+                        if "취소" in clean_text or "그만" in clean_text:
+                            music_mode = False
+                            speak("취소합니다.")
+                        else:
+                            play_music_by_keyword(clean_text)
+                        continue
+
+                    if any(x in clean_text for x in ["몇명", "사람몇", "인원"]):
+                        cnt = current_person_count
+                        ans = "지금은 아무도 안 보입니다." if cnt == 0 else f"현재 {cnt}명이 보입니다."
+                        print(f"▷ 월-이: {ans}")
+                        speak(ans)
+                        continue
+
+                    command_executed = False
+                    for cmd in commands_list:
+                        if any(keyword.replace(" ", "") in clean_text for keyword in cmd.get('keywords', [])):
+                            if cmd.get('type') == 'time_check':
+                                now = datetime.datetime.now()
+                                days = ["월", "화", "수", "목", "금", "토", "일"]
+                                day_str = days[now.weekday()]
+                                if any(x in clean_text for x in ["며칠", "날짜", "요일"]):
+                                     msg = f"오늘은 {now.month}월 {now.day}일 {day_str}요일입니다."
+                                else:
+                                     msg = f"현재 시각은 {now.hour}시 {now.minute}분입니다."
+                                print(f"▷ 월-이: {msg}")
+                                speak(msg)
+                                command_executed = True
+                                break
+                            elif cmd.get('type') == 'music_start':
+                                music_mode = True
+                                speak(cmd.get('response'))
+                                command_executed = True
+                                break
+                            elif cmd.get('type') == 'music_stop':
+                                if music_process:
+                                    music_process.kill()
+                                    music_process = None
+                                music_mode = False 
+                                speak(cmd.get('response'))
+                                command_executed = True
+                                break
+                            elif cmd.get('type') == 'serial':
+                                send_command(cmd.get('cmd'), cmd.get('v1', 0), cmd.get('v2', 0))
+                                if cmd.get('response'): 
+                                    speak(cmd.get('response'))
+                                duration = cmd.get('duration', 0)
+                                if duration > 0:
+                                    time.sleep(duration)
+                                    send_command("STOP", 0, 0)
+                                command_executed = True
+                                break 
+                    
+                    if command_executed: continue
+                    
+                    is_llm_processing = True
+                    print("[시스템] 생각 집중 모드...", end=" ", flush=True)
+                    try:
+                        now = datetime.datetime.now()
+                        time_context = f"[현재 시각: {now.strftime('%Y년 %m월 %d일 %H시 %M분')}]"
+                        messages = [{'role': 'system', 'content': BASE_SYSTEM_PROMPT + "\n" + time_context}]
+                        messages.extend(chat_history)
+                        messages.append({'role': 'user', 'content': text})
+
+                        stream = ollama.chat(
+                            model=LLM_MODEL,
+                            messages=messages,
+                            stream=True
+                        )
+                        
+                        full_response = ""
+                        print("\n▷ 월-이: ", end="", flush=True)
+                        for chunk in stream:
+                            chunk_content = chunk['message']['content']
+                            print(chunk_content, end="", flush=True)
+                            full_response += chunk_content
+                        print() 
+                        
+                        if full_response.strip():
+                            # 여기서 speak를 호출 -> is_speaking=True가 됨 -> 마이크 루프에서 listen 안 함
+                            speak(full_response.strip())
+                            
+                            chat_history.append({'role': 'user', 'content': text})
+                            chat_history.append({'role': 'assistant', 'content': full_response})
+                            if len(chat_history) > MAX_HISTORY * 2:
+                                chat_history = chat_history[-MAX_HISTORY*2:]
+                    except Exception as e:
+                        print(f"\n[LLM 오류] {e}")
+                        speak("오류가 발생했습니다.")
+                    finally:
+                        is_llm_processing = False
+                        print("[시스템] 생각 완료.")
+
+    except Exception as e:
+        print(f"\n[오디오 스레드 에러] {e}")
+
+# --- 메인 실행 ---
+def main():
+    global running, current_person_count, is_llm_processing
+
+    init_serial()
+
+    t_audio = threading.Thread(target=audio_thread_func)
+    t_audio.daemon = True
+    t_audio.start()
+
+    if not os.path.exists(MODEL_PATH):
+        print(f"[오류] 모델 파일 없음: {MODEL_PATH}")
+        return
+
+    # TFLite 모델 로드
+    interpreter = Interpreter(model_path=MODEL_PATH)
+    interpreter.allocate_tensors()
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    h_in, w_in = input_details[0]['shape'][1], input_details[0]['shape'][2]
+    is_int8 = (input_details[0]['dtype'] == np.uint8)
+
+    print("[비전] 카메라 시작...")
+    try:
+        picam2 = Picamera2()
+        config = picam2.create_video_configuration(main={"format": 'RGB888', "size": (640, 480)})
+        picam2.configure(config)
+        picam2.start()
+        
+        try:
+            picam2.set_controls({"AfMode": controls.AfModeEnum.Continuous})
+        except AttributeError:
+            try: picam2.set_controls({"AfMode": 2})
+            except: pass
+            
+    except Exception as e:
+        print(f"[치명적 오류] 카메라 시작 실패: {e}")
+        running = False
+        return
+
+    print("[시스템] 모든 로딩 완료. Wall-E 기동!")
+    send_command("READY", 0, 0)
+    speak("시스템 가동. 월 이 준비 완료.")
+
+    try:
+        while running:
+            # LLM 처리 중에는 비전 루프 일시정지 (CPU 확보)
+            if is_llm_processing:
+                time.sleep(0.1) 
+                continue
+
+            frame = picam2.capture_array()
+            if frame is None: 
+                time.sleep(0.01)
+                continue
+
+            h_orig, w_orig, _ = frame.shape
+            display_frame = frame.copy() 
+
+            input_img = cv2.resize(frame, (w_in, h_in))
+            input_rgb = cv2.cvtColor(input_img, cv2.COLOR_BGR2RGB)
+            
+            input_data = np.expand_dims(input_rgb, axis=0)
+            if not is_int8:
+                input_data = input_data.astype(np.float32) / 255.0
+
+            start_time = time.time()
+            interpreter.set_tensor(input_details[0]['index'], input_data)
+            interpreter.invoke()
+            output_data = interpreter.get_tensor(output_details[0]['index'])[0]
+
+            if output_data.shape[0] < output_data.shape[1]:
+                output_data = output_data.T
+
+            boxes, confs, class_ids = [], [], []
+            
+            for det in output_data:
+                scores = det[4:] 
+                class_id = np.argmax(scores)
+                confidence = scores[class_id]
+
+                if confidence > CONF_THRESHOLD:
+                    cx, cy, w, h = det[0:4]
+                    x_min = int((cx - w / 2) * w_orig)
+                    y_min = int((cy - h / 2) * h_orig)
+                    w_box = int(w * w_orig)
+                    h_box = int(h * h_orig)
+                    
+                    boxes.append([max(0, x_min), max(0, y_min), w_box, h_box])
+                    confs.append(float(confidence))
+                    class_ids.append(class_id)
+
+            indices = cv2.dnn.NMSBoxes(boxes, confs, CONF_THRESHOLD, 0.4)
+
+            person_cnt_frame = 0 
+            if len(indices) > 0:
+                for i in indices.flatten():
+                    x, y, w, h = boxes[i]
+                    label = CLASSES[class_ids[i]]
+                    score = confs[i]
+                    
+                    if label == "Person":
+                        person_cnt_frame += 1
+
+                    # 색상 (BGR 기준)
+                    color = (0, 255, 0) # 기본 녹색
+                    if label == "Face": color = (0, 0, 255)   # Red
+                    elif label == "Person": color = (255, 0, 0) # Blue
+
+                    cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, 2)
+                    cv2.putText(display_frame, f"{label} {score:.2f}", (x, y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+            current_person_count = person_cnt_frame
+
+            fps = 1.0 / (time.time() - start_time + 0.00001)
+            cv2.putText(display_frame, f"FPS: {fps:.1f} | Person: {person_cnt_frame}", (10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            
+            # [수정] 변환 없이 그대로 출력 (사용자 요청)
+            cv2.imshow("Wall-E Vision", display_frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                running = False
+                break
+
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"[메인 루프 오류] {e}")
+    finally:
+        running = False
+        if music_process:
+            try: music_process.kill()
+            except: pass
+        if 'picam2' in locals() and picam2:
+            try: picam2.stop()
+            except: pass
+        cv2.destroyAllWindows()
+        if arduino_ser:
+            send_command("RELAY", 0)
+            arduino_ser.close()
+        print("[시스템] 종료 완료")
+
+if __name__ == "__main__":
+    main()
