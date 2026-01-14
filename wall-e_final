@@ -46,13 +46,13 @@ COMMANDS_FILE = "commands.yaml"
 PROFILE_FILE = "user_profile.yaml"
 
 # [AI 모델 설정]
-MODEL_PATH = "/home/yorce23/Downloads/1230_best_float16.tflite"
-CLASSES = ["Face", "Hand", "Person"] 
+MODEL_PATH = "YOUR DIR"
+CLASSES = [YOUR CLASS] 
 CONF_THRESHOLD = 0.5
-LLM_MODEL = "qwen2.5:3b"
+LLM_MODEL = "qwen2.5:1.5b"
 
 # [음악 설정]
-MUSIC_DIR = "/home/yorce23/Desktop/music"
+MUSIC_DIR = "YOUR DIR"
 
 # [목소리 설정]
 VOICE_KO = "ko-KR-SunHiNeural"   
