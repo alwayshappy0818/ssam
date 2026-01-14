@@ -1,0 +1,101 @@
+commands:
+  - name: "전진"
+    keywords: ["앞으로", "전진", "가자"]
+    type: "serial"
+    cmd: "MOVE"
+    v1: 150
+    v2: 150
+    response: "앞으로 전진합니다."
+    duration: 2 # 2초간 이동 후 정지 (선택 사항)
+
+  - name: "후진"
+    keywords: ["뒤로", "후진", "빠져"]
+    type: "serial"
+    cmd: "MOVE"
+    v1: -150
+    v2: -150
+    response: "뒤로 물러납니다."
+    duration: 2
+
+  - name: "정지"
+    keywords: ["멈춰", "정지", "그만", "스톱"]
+    type: "serial"
+    cmd: "STOP"
+    v1: 0
+    v2: 0
+    response: "정지합니다."
+
+  - name: "우회전"
+    keywords: ["오른쪽", "우회전"]
+    type: "serial"
+    cmd: "MOVE"
+    v1: 150
+    v2: -150
+    response: "오른쪽으로 돕니다."
+    duration: 1
+
+  - name: "좌회전"
+    keywords: ["왼쪽", "좌회전"]
+    type: "serial"
+    cmd: "MOVE"
+    v1: -150
+    v2: 150
+    response: "왼쪽으로 돕니다."
+    duration: 1
+
+  - name: "댄스"
+    keywords: ["춤춰", "댄스", "춤 춰"]
+    type: "serial"
+    cmd: "DANCE"
+    v1: 0
+    v2: 0
+    response: "신나게 춤을 춰볼까요?"
+
+  - name: "인사"
+    keywords: ["안녕", "반가워"]
+    type: "serial"
+    cmd: "ARM"
+    v1: 180
+    v2: 180
+    response: "안녕하세요, 월-이입니다."
+
+  - name: "차렷"
+    keywords: ["손내려", "차렷"]
+    type: "serial"
+    cmd: "ARM"
+    v1: 0
+    v2: 0
+    response: "차렷 자세를 취합니다."
+
+  - name: "눈 켜기"
+    keywords: ["불 켜", "불켜", "눈 떠", "눈떠"]
+    type: "serial"
+    cmd: "EYE"
+    v1: 1
+    v2: 0
+    response: "조명을 켭니다."
+
+  - name: "눈 끄기"
+    keywords: ["불 꺼", "불꺼", "눈 감아", "눈감아"]
+    type: "serial"
+    cmd: "EYE"
+    v1: 0
+    v2: 0
+    response: "조명을 끕니다."
+
+  # [음악 관련]
+  - name: "음악 모드"
+    keywords: ["음악 틀어줘", "노래 틀어줘", "노래 듣자", "음악 듣자", "노래 틀어 줘", "음악 틀어 줘"]
+    type: "music_start" 
+    response: "어떤 음악을 틀어드릴까요?"
+
+  - name: "음악 끄기"
+    keywords: ["노래 꺼", "음악 꺼", "노래 멈춰", "음악 멈춰", "조용히 해", "시끄러", "닥쳐"]
+    type: "music_stop"
+    response: "음악을 끕니다."
+
+  # [시간 확인]
+  - name: "시간 확인"
+    keywords: ["몇 시", "지금 몇시", "시간 알려줘", "며칠", "날짜", "무슨 요일"]
+    type: "time_check"
+    response: "" # 코드가 현재 시간을 채워넣음
