@@ -1,0 +1,27 @@
+# 파일 경로: config/settings.py
+import os
+
+# 프로젝트 루트 경로 계산
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 하드웨어 설정
+SERIAL_PORT = '/dev/ttyACM0' 
+BAUD_RATE = 115200
+MIC_DEVICE_INDEX = None # 시스템 기본
+
+# 파일 경로
+COMMANDS_FILE = os.path.join(BASE_DIR, "commands.yaml")
+PROFILE_FILE = os.path.join(BASE_DIR, "user_profile.yaml")
+MUSIC_DIR = "YOUR DIR" # 사용자 지정 경로 유지
+MODEL_PATH = "YOUR DIR"
+TEMP_VOICE_FILE = os.path.join(BASE_DIR, "temp_voice.mp3")
+
+# AI 설정
+CLASSES = ["YOUR CLASS"] 
+CONF_THRESHOLD = 0.5
+LLM_MODEL = "qwen2.5:1.5b"
+
+# TTS 목소리 설정
+VOICE_KO = "ko-KR-SunHiNeural"   
+VOICE_EN = "en-US-AnaNeural"     
+VOICE_JP = "ja-JP-KeitaNeural"
