@@ -1,0 +1,13 @@
+# 파일 경로: utils/state.py
+
+class SharedState:
+    def __init__(self):
+        self.running = True            # 프로그램 실행 플래그
+        self.current_person_count = 0  # 감지된 사람 수
+        self.is_llm_processing = False # LLM 생각 중 (비전 일시정지용)
+        self.music_mode = False        # 음악 대기 모드
+        self.music_list = []           # 음악 파일 목록
+        self.music_process = None      # 음악 재생 프로세스
+
+# 전역 상태 인스턴스 생성
+state = SharedState()
