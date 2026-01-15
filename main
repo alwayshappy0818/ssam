@@ -1,0 +1,30 @@
+# 파일 경로: main.py
+import threading
+import time
+from modules.arduino import arduino
+from modules.audio import audio_thread_func
+from modules.vision import vision_thread_func
+from modules.music import stop_music
+from utils.state import state
+
+def main():
+    # 1. 아두이노 연결
+    arduino.connect()
+    
+    # 2. 오디오 스레드 시작
+    t_audio = threading.Thread(target=audio_thread_func)
+    t_audio.daemon = True
+    t_audio.start()
+    
+    # 3. 비전 루프 (메인 스레드에서 실행 - GUI 때문)
+    # 비전 함수 내부에서 준비 완료 시 아두이노 READY 신호를 보냄
+    vision_thread_func()
+    
+    # 4. 종료 처리
+    print("[시스템] 종료 중...")
+    state.running = False
+    stop_music()
+    arduino.close()
+
+if __name__ == "__main__":
+    main()
