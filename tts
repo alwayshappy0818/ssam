@@ -1,0 +1,41 @@
+# 파일 경로: modules/tts.py
+import os
+import time
+import subprocess
+from gtts import gTTS
+from config import settings
+from utils.common import detect_language
+
+def speak(text):
+    if not text: return
+    
+    lang_code = detect_language(text)
+    selected_voice = settings.VOICE_EN
+    if lang_code == 'ko': selected_voice = settings.VOICE_KO
+    elif lang_code == 'ja': selected_voice = settings.VOICE_JP
+    
+    print(f"[TTS] {text} (Voice: {selected_voice})")
+    
+    edge_tts_path = os.path.expanduser("YOUR DIR")
+    if not os.path.exists(edge_tts_path):
+        edge_tts_path = "edge-tts"
+
+    command = [
+        edge_tts_path,
+        "--text", text,
+        "--write-media", settings.TEMP_VOICE_FILE,
+        "--voice", selected_voice,
+        "--rate=+10%", 
+        "--pitch=+0Hz"
+    ]
+    
+    try:
+        subprocess.run(command, check=True)
+        subprocess.run(
+            ["mplayer", "-volume", "100", "-speed", "1.3", "-really-quiet", settings.TEMP_VOICE_FILE],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except Exception as e:
+        print(f"[TTS 오류] {e}")
+    finally:
+        time.sleep(0.5)
