@@ -1,0 +1,141 @@
+# 파일 경로: modules/vision.py
+import sys
+import os
+import cv2
+import numpy as np
+import time
+from config import settings
+from utils.state import state
+from modules.arduino import arduino
+
+# 라이브러리 로드
+sys.path.append('/usr/lib/python3/dist-packages')
+try:
+    from ai_edge_litert.interpreter import Interpreter
+    from picamera2 import Picamera2
+    try: from libcamera import controls
+    except: controls = None
+except ImportError:
+    print("[오류] 비전 라이브러리 로드 실패")
+    sys.exit(1)
+
+def vision_thread_func():
+    if not os.path.exists(settings.MODEL_PATH):
+        print(f"[오류] 모델 없음: {settings.MODEL_PATH}")
+        return
+
+    interpreter = Interpreter(model_path=settings.MODEL_PATH)
+    interpreter.allocate_tensors()
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    h_in, w_in = input_details[0]['shape'][1], input_details[0]['shape'][2]
+    is_int8 = (input_details[0]['dtype'] == np.uint8)
+
+    print("[비전] 카메라 시작...")
+    try:
+        picam2 = Picamera2()
+        config = picam2.create_video_configuration(main={"format": 'RGB888', "size": (640, 480)})
+        picam2.configure(config)
+        picam2.start()
+        try: picam2.set_controls({"AfMode": 2})
+        except: pass
+    except Exception as e:
+        print(f"[오류] 카메라 실패: {e}")
+        return
+
+    # 부팅 완료 신호 전송
+    print("[시스템] 모든 로딩 완료. Wall-E 기동!")
+    arduino.send_command("READY", 0, 0)
+
+    try:
+        while state.running:
+            if state.is_llm_processing:
+                time.sleep(0.1)
+                continue
+
+            frame = picam2.capture_array()
+            if frame is None:
+                time.sleep(0.01)
+                continue
+
+            # 전처리
+            input_img = cv2.resize(frame, (w_in, h_in))
+            input_rgb = cv2.cvtColor(input_img, cv2.COLOR_BGR2RGB) # 모델 입력용 변환
+            
+            input_data = np.expand_dims(input_rgb, axis=0)
+            if not is_int8:
+                input_data = input_data.astype(np.float32) / 255.0
+
+            # 추론
+            start_time = time.time()
+            interpreter.set_tensor(input_details[0]['index'], input_data)
+            interpreter.invoke()
+            output_data = interpreter.get_tensor(output_details[0]['index'])[0]
+
+            if output_data.shape[0] < output_data.shape[1]:
+                output_data = output_data.T
+
+            # 후처리
+            boxes, confs, class_ids = [], [], []
+            h_orig, w_orig, _ = frame.shape
+            
+            for det in output_data:
+                scores = det[4:] 
+                class_id = np.argmax(scores)
+                confidence = scores[class_id]
+
+                if confidence > settings.CONF_THRESHOLD:
+                    cx, cy, w, h = det[0:4]
+                    x_min = int((cx - w / 2) * w_orig)
+                    y_min = int((cy - h / 2) * h_orig)
+                    w_box = int(w * w_orig)
+                    h_box = int(h * h_orig)
+                    
+                    boxes.append([max(0, x_min), max(0, y_min), w_box, h_box])
+                    confs.append(float(confidence))
+                    class_ids.append(class_id)
+
+            indices = cv2.dnn.NMSBoxes(boxes, confs, settings.CONF_THRESHOLD, 0.4)
+
+            # 디스플레이용 프레임 (원본 RGB)
+            # 사용자가 원본 그대로 출력해야 파란색이 아니라고 했으므로 변환 X
+            display_frame = frame.copy() 
+
+            person_cnt = 0
+            if len(indices) > 0:
+                for i in indices.flatten():
+                    x, y, w, h = boxes[i]
+                    label = settings.CLASSES[class_ids[i]]
+                    score = confs[i]
+                    
+                    if label == "Person": person_cnt += 1
+                    
+                    # 색상 (BGR 기준: Blue=255,0,0 / Red=0,0,255)
+                    # 현재 display_frame은 RGB이므로 (R,G,B)로 줘야 함
+                    color = (0, 255, 0) 
+                    if label == "Face": color = (255, 0, 0)
+                    elif label == "Person": color = (0, 0, 255)
+
+                    cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, 2)
+                    cv2.putText(display_frame, f"{label} {score:.2f}", (x, y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+            state.current_person_count = person_cnt
+
+            fps = 1.0 / (time.time() - start_time + 0.00001)
+            cv2.putText(display_frame, f"FPS: {fps:.1f} | Person: {person_cnt}", (10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            
+            cv2.imshow("Wall-E Vision", display_frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                state.running = False
+                break
+
+    except Exception as e:
+        print(f"[비전 오류] {e}")
+    finally:
+        if 'picam2' in locals() and picam2:
+            try: picam2.stop()
+            except: pass
+        cv2.destroyAllWindows()
