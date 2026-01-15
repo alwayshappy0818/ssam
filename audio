@@ -1,0 +1,238 @@
+# 파일 경로: modules/audio.py
+import time
+import datetime
+import speech_recognition as sr
+import ollama
+import os
+import subprocess
+
+from config import settings
+from utils.state import state
+from utils.common import ignore_stderr, no_alsa_error, load_yaml
+from modules.arduino import arduino
+from modules.tts import speak
+from modules.music import scan_music_files, play_music_by_keyword, stop_music
+
+def setup_audio_volume():
+    print("[시스템] 오디오 볼륨 강제 설정 (wm8960)...")
+    target_card = "-D hw:wm8960soundcard"
+    commands = [
+        f"amixer {target_card} sset 'Playback' 34% unmute",
+        f"amixer {target_card} sset 'Master' 100% unmute",
+        f"amixer {target_card} sset 'Speaker' 100% unmute",
+        f"amixer {target_card} sset 'Headphone' 100% unmute",
+        f"amixer {target_card} sset 'Capture' 100% unmute",
+        f"amixer {target_card} sset 'ADC PCM' 100% unmute",
+        f"amixer {target_card} sset 'Digital' 90% unmute",
+        f"amixer {target_card} sset '3D' 0",
+        f"amixer {target_card} sset 'ALC' off"
+    ]
+    for cmd in commands:
+        os.system(cmd + " > /dev/null 2>&1")
+    print("[시스템] 볼륨 설정 완료.")
+
+def find_microphone():
+    print("[오디오] 마이크 장치 검색 중...")
+    priority_keywords = ["wm8960", "seeed", "usb"]
+    try:
+        mic_list = sr.Microphone.list_microphone_names()
+        for priority in priority_keywords:
+            for index, name in enumerate(mic_list):
+                if priority in name.lower():
+                    print(f"  -> 발견({priority}): [{index}] {name}")
+                    return index
+        return 1
+    except:
+        return 1
+
+def get_system_prompt():
+    profile_data = load_yaml(settings.PROFILE_FILE)
+    p = profile_data.get('profile', {})
+    
+    info_text = f"""
+    이름: {p.get('name', '사용자')}
+    나이: {p.get('age', '알 수 없음')}
+    건강: {', '.join(p.get('health', []))}
+    좋아하는 것: {', '.join(p.get('likes', []))}
+    일정: {', '.join(p.get('schedule', []))}
+    메모: {p.get('memo', '없음')}
+    """
+    
+    return f"""
+    당신은 반려 로봇 '월-이(Wall-E)'입니다. 
+    아래 [사용자 정보]를 기억하고, 가족처럼 대화하세요.
+    {info_text}
+    규칙:
+    1. 답변은 1~2문장으로 짧게(30자 이내) 하세요.
+    2. 딱딱한 말투와 다정한 말투를 섞어쓰세요.
+    3. 사용자가 영어나 일본어로 말하면, 해당 언어로 대답하세요.
+    """
+
+def audio_thread_func():
+    time.sleep(2)
+    setup_audio_volume()
+    scan_music_files()
+    
+    commands_data = load_yaml(settings.COMMANDS_FILE)
+    commands_list = commands_data.get('commands', [])
+    print(f"[시스템] {len(commands_list)}개의 명령어 로드 완료.")
+    
+    recognizer = sr.Recognizer()
+    recognizer.dynamic_energy_threshold = False
+    recognizer.energy_threshold = 300 
+    
+    mic_index = find_microphone()
+    try:
+        mic = sr.Microphone(device_index=mic_index, sample_rate=None, chunk_size=2048)
+    except Exception as e:
+        print(f"[오류] 마이크 초기화 실패: {e}")
+        return
+
+    chat_history = []
+    MAX_HISTORY = 10
+    base_prompt = get_system_prompt()
+
+    try:
+        with ignore_stderr():
+            with mic as source:
+                recognizer.adjust_for_ambient_noise(source, duration=1)
+                
+                while state.running:
+                    if state.is_llm_processing:
+                        time.sleep(0.1)
+                        continue
+
+                    # 음악 재생 중이면 감도 조절
+                    if state.music_process and state.music_process.poll() is None:
+                        recognizer.energy_threshold = 1000
+                    else:
+                        recognizer.energy_threshold = 300
+
+                    audio = None
+                    try:
+                        limit = 3 if (state.music_process and state.music_process.poll() is None) else 5
+                        audio = recognizer.listen(source, timeout=1, phrase_time_limit=limit)
+                    except sr.WaitTimeoutError:
+                        continue 
+                    except Exception:
+                        continue
+
+                    text = ""
+                    if audio:
+                        try:
+                            # SW 증폭
+                            raw_data = audio.get_raw_data(convert_rate=16000, convert_width=2)
+                            import numpy as np
+                            audio_np = np.frombuffer(raw_data, dtype=np.int16)
+                            audio_np = np.clip(audio_np * 2.0, -32768, 32767).astype(np.int16)
+                            amplified_audio = sr.AudioData(audio_np.tobytes(), 16000, 2)
+                            
+                            text = recognizer.recognize_google(amplified_audio, language='ko-KR')
+                            print(f"\n▶ 사용자: \"{text}\"")
+                        except: pass
+
+                    if not text: continue
+                    clean_text = text.replace(" ", "")
+
+                    # 1. 음악 끄기 (최우선)
+                    if any(x in clean_text for x in ["음악꺼", "노래꺼", "시끄러", "조용히", "닥쳐", "멈춰", "그만"]):
+                        if state.music_process and state.music_process.poll() is None:
+                            stop_music()
+                            print("[음악] 정지")
+                            speak("음악을 끕니다.")
+                            continue
+
+                    # 2. 음악 모드 제목 대기
+                    if state.music_mode:
+                        if "취소" in clean_text or "그만" in clean_text:
+                            state.music_mode = False
+                            speak("취소합니다.")
+                        else:
+                            play_music_by_keyword(clean_text)
+                        continue
+
+                    # 3. 사람 수 확인
+                    if any(x in clean_text for x in ["몇명", "사람몇", "인원"]):
+                        cnt = state.current_person_count
+                        ans = "지금은 아무도 안 보입니다." if cnt == 0 else f"현재 {cnt}명이 보입니다."
+                        print(f"▷ 월-이: {ans}")
+                        speak(ans)
+                        continue
+
+                    # 4. 명령어 매칭
+                    command_executed = False
+                    for cmd in commands_list:
+                        if any(keyword.replace(" ", "") in clean_text for keyword in cmd.get('keywords', [])):
+                            ctype = cmd.get('type')
+                            
+                            if ctype == 'time_check':
+                                now = datetime.datetime.now()
+                                days = ["월", "화", "수", "목", "금", "토", "일"]
+                                if any(x in clean_text for x in ["며칠", "날짜", "요일"]):
+                                     msg = f"오늘은 {now.month}월 {now.day}일 {days[now.weekday()]}요일입니다."
+                                else:
+                                     msg = f"현재 시각은 {now.hour}시 {now.minute}분입니다."
+                                print(f"▷ 월-이: {msg}")
+                                speak(msg)
+                                command_executed = True
+                            
+                            elif ctype == 'music_start':
+                                state.music_mode = True
+                                speak(cmd.get('response'))
+                                command_executed = True
+                            
+                            elif ctype == 'music_stop':
+                                stop_music()
+                                state.music_mode = False
+                                speak(cmd.get('response'))
+                                command_executed = True
+                            
+                            elif ctype == 'serial':
+                                arduino.send_command(cmd.get('cmd'), cmd.get('v1', 0), cmd.get('v2', 0))
+                                if cmd.get('response'): speak(cmd.get('response'))
+                                duration = cmd.get('duration', 0)
+                                if duration > 0:
+                                    time.sleep(duration)
+                                    arduino.send_command("STOP", 0, 0)
+                                command_executed = True
+                            break
+                    
+                    if command_executed: continue
+                    
+                    # 5. LLM 대화
+                    state.is_llm_processing = True
+                    print("[시스템] 생각 집중 모드...", end=" ", flush=True)
+                    try:
+                        now = datetime.datetime.now()
+                        time_ctx = f"[현재 시각: {now.strftime('%Y-%m-%d %H:%M')}]"
+                        
+                        messages = [{'role': 'system', 'content': base_prompt + "\n" + time_ctx}]
+                        messages.extend(chat_history)
+                        messages.append({'role': 'user', 'content': text})
+
+                        stream = ollama.chat(model=settings.LLM_MODEL, messages=messages, stream=True)
+                        
+                        full_res = ""
+                        print("\n▷ 월-이: ", end="", flush=True)
+                        for chunk in stream:
+                            content = chunk['message']['content']
+                            print(content, end="", flush=True)
+                            full_res += content
+                        print() 
+                        
+                        if full_res.strip():
+                            speak(full_res.strip())
+                            chat_history.append({'role': 'user', 'content': text})
+                            chat_history.append({'role': 'assistant', 'content': full_res})
+                            if len(chat_history) > MAX_HISTORY * 2:
+                                chat_history = chat_history[-MAX_HISTORY*2:]
+                                
+                    except Exception as e:
+                        print(f"\n[LLM 오류] {e}")
+                        speak("오류가 발생했습니다.")
+                    finally:
+                        state.is_llm_processing = False
+                        print("[시스템] 생각 완료.")
+
+    except Exception as e:
+        print(f"\n[오디오 스레드 에러] {e}")
