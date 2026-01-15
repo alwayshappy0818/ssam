@@ -1,0 +1,34 @@
+# 파일 경로: modules/arduino.py
+import serial
+import time
+from config import settings
+
+class ArduinoController:
+    def __init__(self):
+        self.ser = None
+
+    def connect(self):
+        try:
+            print(f"[시스템] 아두이노({settings.SERIAL_PORT}) 연결 시도...", end=" ")
+            self.ser = serial.Serial(settings.SERIAL_PORT, settings.BAUD_RATE, timeout=1)
+            time.sleep(2) 
+            print("성공! (대기 모드)")
+            return True
+        except Exception as e:
+            print(f"\n[경고] 아두이노 연결 실패: {e}")
+            return False
+
+    def send_command(self, cmd, v1=0, v2=0):
+        if self.ser and self.ser.is_open:
+            msg = f"<{cmd},{v1},{v2}>"
+            try:
+                self.ser.write(msg.encode())
+            except: pass
+    
+    def close(self):
+        if self.ser:
+            self.send_command("RELAY", 0) # 전원 차단
+            self.ser.close()
+
+# 싱글톤 인스턴스
+arduino = ArduinoController()
