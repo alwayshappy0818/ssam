@@ -1,0 +1,28 @@
+from google.colab import drive
+import shutil
+import os
+
+# 1. 구글 드라이브 마운트
+drive.mount('/content/drive')
+
+# 2. 저장할 경로 (구글 드라이브)
+destination_dir = "/content/drive/MyDrive/0_Wall-E_Model"
+if not os.path.exists(destination_dir):
+    os.makedirs(destination_dir)
+
+# 3. 현재 폴더(.)에서 GGUF 파일 찾기
+# 사용자가 말한 파일명 패턴이나 확장자로 검색
+current_dir = "."
+files = [f for f in os.listdir(current_dir) if f.endswith('.gguf')]
+
+if files:
+    for file in files:
+        print(f"파일 발견: {file}")
+        src = os.path.join(current_dir, file)
+        dst = os.path.join(destination_dir, file)
+
+        print(f"구글 드라이브로 복사 중... -> {dst}")
+        shutil.copy(src, dst)
+        print("복사 완료!")
+else:
+    print("현재 폴더에 .gguf 파일이 없습니다. 파일명을 확인해주세요.")
