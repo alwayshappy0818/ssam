@@ -1,0 +1,308 @@
+import cv2
+import time
+import serial
+import threading
+import numpy as np
+from flask import Flask, Response, render_template_string, request, jsonify
+import sys
+import math
+import ssl
+import socket
+import os
+import subprocess
+import signal
+import shutil
+
+# --- 설정 ---
+SERIAL_PORT = '/dev/ttyACM0'
+BAUD_RATE = 115200
+PORT = 8000
+CAMERA_WIDTH = 480
+CAMERA_HEIGHT = 360
+
+# 파일 경로
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CERT_FILE = os.path.join(BASE_DIR, 'cert.pem')
+KEY_FILE = os.path.join(BASE_DIR, 'key.pem')
+
+# [전역 변수]
+global_frame = None
+frame_lock = threading.Lock()
+
+def get_ip_address():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return '127.0.0.1'
+
+HOST_IP = get_ip_address()
+
+def ensure_certificates():
+    print(f"[시스템] SSL 인증서 확인 중... (IP: {HOST_IP})")
+    if os.path.exists(CERT_FILE): os.remove(CERT_FILE)
+    if os.path.exists(KEY_FILE): os.remove(KEY_FILE)
+
+    cmd = [
+        "openssl", "req", "-x509", "-newkey", "rsa:4096", "-sha256", "-days", "3650", "-nodes",
+        "-keyout", KEY_FILE,
+        "-out", CERT_FILE,
+        "-subj", f"/CN={HOST_IP}",
+        "-addext", f"subjectAltName=IP:{HOST_IP}"
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("[시스템] 인증서 생성 완료.")
+    except Exception as e:
+        print(f"[오류] 인증서 생성 실패: {e}")
+        sys.exit(1)
+
+# 아두이노 연결
+try:
+    arduino = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+    time.sleep(2)
+    arduino.write(b"<RELAY,1,0>") 
+    time.sleep(0.5)
+    arduino.write(b"<HEAD,90,90>")
+    print("[시스템] 아두이노 연결 성공")
+except Exception as e:
+    print(f"[오류] 아두이노 연결 실패: {e}")
+    arduino = None
+
+app = Flask(__name__)
+
+# --- [핵심] 서브프로세스 기반 카메라 매니저 ---
+class CameraManager:
+    def __init__(self):
+        self.process = None
+        self.running = False
+        self.thread = None
+
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._run_camera, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.process:
+            self.process.terminate()
+
+    def _run_camera(self):
+        global global_frame
+        
+        # 1. 좀비 프로세스 정리
+        subprocess.run(["pkill", "rpicam-vid"], stderr=subprocess.DEVNULL)
+        subprocess.run(["pkill", "libcamera-vid"], stderr=subprocess.DEVNULL)
+        time.sleep(1)
+
+        # 2. 명령어 설정 (rpicam-vid 또는 libcamera-vid)
+        # -t 0: 무한
+        # --inline: 스트리밍용
+        # -o -: 표준 출력(stdout)으로 데이터 전송
+        prog = "rpicam-vid"
+        if not shutil.which(prog):
+            prog = "libcamera-vid"
+            
+        cmd = [
+            prog, "-t", "0", "--inline", "--nopreview",
+            "--width", str(CAMERA_WIDTH), "--height", str(CAMERA_HEIGHT),
+            "--framerate", "30", "--codec", "mjpeg", "-o", "-"
+        ]
+        
+        print(f"[비전] {prog} 프로세스 시작...")
+        
+        try:
+            # bufsize=0 (Unbuffered) 필수
+            self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+        except Exception as e:
+            print(f"[치명적 오류] 카메라 실행 실패: {e}")
+            return
+
+        stream_buffer = b''
+        
+        while self.running:
+            # 프로세스 생존 확인
+            if self.process.poll() is not None:
+                print("[오류] 카메라 프로세스 사망. 재시작...")
+                self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+                time.sleep(1)
+                continue
+
+            try:
+                # 데이터 읽기 (4KB 단위)
+                chunk = self.process.stdout.read(4096)
+                if not chunk:
+                    time.sleep(0.01)
+                    continue
+                
+                stream_buffer += chunk
+                
+                # JPEG 파싱
+                a = stream_buffer.find(b'\xff\xd8')
+                b = stream_buffer.find(b'\xff\xd9')
+                
+                if a != -1 and b != -1:
+                    jpg = stream_buffer[a:b+2]
+                    stream_buffer = stream_buffer[b+2:]
+                    
+                    with frame_lock:
+                        global_frame = jpg
+                        
+                # 버퍼 오버플로우 방지
+                if len(stream_buffer) > 1024*1024:
+                    stream_buffer = b''
+                    
+            except Exception as e:
+                print(f"[카메라 오류] {e}")
+                time.sleep(0.1)
+
+camera_manager = CameraManager()
+camera_manager.start()
+
+def send_cmd(cmd, v1, v2):
+    if arduino and arduino.is_open:
+        msg = f"<{cmd},{int(v1)},{int(v2)}>"
+        try:
+            arduino.write(msg.encode())
+        except: pass
+
+def generate_frames():
+    """웹으로 최신 프레임만 전송"""
+    while True:
+        with frame_lock:
+            frame_data = global_frame
+        
+        if frame_data:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_data + b'\r\n')
+        else:
+            time.sleep(0.05)
+            continue
+        time.sleep(0.03)
+
+@app.route('/')
+def index():
+    return render_template_string('''
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>Wall-E Controller</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <style>
+            body { margin: 0; background: #000; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; color: #0f0; font-family: monospace; }
+            img { width: 100%; height: 100%; object-fit: contain; position: absolute; z-index: 1; }
+            #ui { position: absolute; top: 10px; left: 10px; z-index: 100; background: rgba(0,0,0,0.7); padding: 10px; pointer-events: none; border-radius: 5px; }
+            .info { font-size: 16px; font-weight: bold; margin-bottom: 5px; }
+            .debug { font-size: 12px; color: #ff0; white-space: pre-wrap; }
+            #start-btn { position: absolute; bottom: 20px; z-index: 200; padding: 15px 30px; font-size: 20px; background: #f00; color: white; border: none; border-radius: 10px; cursor: pointer; }
+        </style>
+      </head>
+      <body>
+        <div id="ui">
+            <div id="status" class="info">Waiting for Gamepad...</div>
+            <div id="debug"></div>
+        </div>
+        <img src="/video_feed" onerror="this.src='/video_feed'">
+        <button id="start-btn" onclick="startApp()">START CONTROL</button>
+
+        <script>
+            const statusDiv = document.getElementById('status');
+            const debugDiv = document.getElementById('debug');
+            const startBtn = document.getElementById('start-btn');
+            let lastUpdate = 0;
+            let isSending = false;
+
+            function startApp() {
+                startBtn.style.display = 'none';
+                document.documentElement.requestFullscreen().catch(e => {});
+                statusDiv.innerText = "System Active";
+            }
+
+            function updateLoop() {
+                const gamepads = navigator.getGamepads ? navigator.getGamepads() : [];
+                let gp = null;
+
+                for (let i = 0; i < gamepads.length; i++) {
+                    if (gamepads[i] && gamepads[i].connected) {
+                        gp = gamepads[i];
+                        break;
+                    }
+                }
+
+                if (gp) {
+                    statusDiv.innerText = "Connected: " + gp.id;
+                    statusDiv.style.color = "#0f0";
+                    
+                    let axisInfo = "";
+                    for(let k=0; k<gp.axes.length; k++) axisInfo += k + ":" + gp.axes[k].toFixed(2) + " ";
+                    debugDiv.innerText = axisInfo;
+
+                    const now = Date.now();
+                    if (now - lastUpdate > 100) { 
+                        lastUpdate = now;
+                        
+                        let joyX = 0, joyY = 0;
+                        if (gp.axes.length >= 4) {
+                            if (Math.abs(gp.axes[2]) > 0.1 || Math.abs(gp.axes[3]) > 0.1) {
+                                joyX = gp.axes[2]; joyY = gp.axes[3]; 
+                            } else if (Math.abs(gp.axes[0]) > 0.1 || Math.abs(gp.axes[1]) > 0.1) {
+                                joyX = gp.axes[0]; joyY = gp.axes[1]; 
+                            }
+                        }
+
+                        let speed = -joyY * 200; 
+                        let turn = joyX * 150;
+                        
+                        if (Math.abs(speed) < 20) speed = 0;
+                        if (Math.abs(turn) < 20) turn = 0;
+                        
+                        fetch('/sync', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ p: 90, t: 90, lm: Math.round(speed + turn), rm: Math.round(speed - turn) })
+                        }).catch(e => {});
+                    }
+                } else {
+                    statusDiv.innerText = "No Controller. Press buttons!";
+                    statusDiv.style.color = "yellow";
+                }
+                requestAnimationFrame(updateLoop);
+            }
+            updateLoop();
+        </script>
+      </body>
+    </html>
+    ''')
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/sync', methods=['POST'])
+def sync():
+    d = request.json
+    send_cmd("HEAD", d['p'], d['t'])
+    send_cmd("MOVE", d['lm'], d['rm'])
+    return jsonify(success=True)
+
+if __name__ == '__main__':
+    ensure_certificates()
+    
+    print("=== [Simple Controller 모드] ===")
+    print(f"퀘스트3 접속: https://{HOST_IP}:{PORT}")
+    
+    if not os.path.exists(CERT_FILE) or not os.path.exists(KEY_FILE):
+        sys.exit(1)
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(CERT_FILE, KEY_FILE)
+
+    try:
+        app.run(host='0.0.0.0', port=PORT, threaded=True, ssl_context=context, debug=False, use_reloader=False)
+    finally:
+        camera_manager.stop()
+        print("종료 중...")
