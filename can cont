@@ -1,0 +1,317 @@
+import cv2
+import time
+import serial
+import threading
+import numpy as np
+from flask import Flask, Response, render_template_string, request, jsonify
+import sys
+import math
+import ssl
+import socket
+import os
+import subprocess
+import signal
+
+# 시스템 패키지 경로
+sys.path.append('/usr/lib/python3/dist-packages')
+from picamera2 import Picamera2
+
+# --- 설정 ---
+SERIAL_PORT = '/dev/ttyACM0'
+BAUD_RATE = 115200
+PORT = 8000
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+
+# 파일 경로
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CERT_FILE = os.path.join(BASE_DIR, 'cert.pem')
+KEY_FILE = os.path.join(BASE_DIR, 'key.pem')
+
+# [전역 변수]
+global_frame = None
+frame_lock = threading.Lock()
+last_frame_time = time.time() 
+
+def get_ip_address():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return '127.0.0.1'
+
+HOST_IP = get_ip_address()
+
+def ensure_certificates():
+    print(f"[시스템] SSL 인증서 확인 중... (IP: {HOST_IP})")
+    if os.path.exists(CERT_FILE): os.remove(CERT_FILE)
+    if os.path.exists(KEY_FILE): os.remove(KEY_FILE)
+
+    cmd = [
+        "openssl", "req", "-x509", "-newkey", "rsa:4096", "-sha256", "-days", "3650", "-nodes",
+        "-keyout", KEY_FILE,
+        "-out", CERT_FILE,
+        "-subj", f"/CN={HOST_IP}",
+        "-addext", f"subjectAltName=IP:{HOST_IP}"
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("[시스템] 인증서 생성 완료.")
+    except Exception as e:
+        print(f"[오류] 인증서 생성 실패: {e}")
+        sys.exit(1)
+
+# 아두이노 연결
+try:
+    arduino = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+    time.sleep(2)
+    arduino.write(b"<RELAY,1,0>") 
+    time.sleep(0.5)
+    arduino.write(b"<HEAD,90,90>")
+    print("[시스템] 아두이노 연결 성공")
+except Exception as e:
+    print(f"[오류] 아두이노 연결 실패: {e}")
+    arduino = None
+
+app = Flask(__name__)
+
+# --- 카메라 스레드 (Picamera2 Native) ---
+class CameraManager:
+    def __init__(self):
+        self.picam2 = None
+        self.running = False
+        self.thread = None
+        self.watchdog_thread = None
+
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._run_camera, daemon=True)
+        self.thread.start()
+        self.watchdog_thread = threading.Thread(target=self._watchdog, daemon=True)
+        self.watchdog_thread.start()
+
+    def stop(self):
+        self.running = False
+        self._cleanup()
+
+    def _cleanup(self):
+        if self.picam2:
+            try: self.picam2.stop()
+            except: pass
+            try: self.picam2.close()
+            except: pass
+            self.picam2 = None
+        subprocess.run(["pkill", "-9", "libcamera-vid"], stderr=subprocess.DEVNULL)
+        subprocess.run(["pkill", "-9", "rpicam-vid"], stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+
+    def _run_camera(self):
+        global global_frame, last_frame_time
+        
+        while self.running:
+            self._cleanup()
+            print("[비전] Picamera2 초기화 시도...")
+            
+            try:
+                self.picam2 = Picamera2()
+                config = self.picam2.create_video_configuration(
+                    main={"format": 'RGB888', "size": (CAMERA_WIDTH, CAMERA_HEIGHT)},
+                    buffer_count=3
+                )
+                self.picam2.configure(config)
+                self.picam2.start()
+                try: self.picam2.set_controls({"AfMode": 2})
+                except: pass
+                
+                print("[비전] 카메라 정상 가동")
+                
+                while self.running:
+                    frame = self.picam2.capture_array()
+                    
+                    if frame is None:
+                        time.sleep(0.1)
+                        continue
+
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    ret, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+                    
+                    if ret:
+                        with frame_lock:
+                            global_frame = buffer.tobytes()
+                            last_frame_time = time.time()
+                    
+                    time.sleep(0.03)
+
+            except Exception as e:
+                print(f"[비전 오류] {e}")
+                time.sleep(1)
+
+    def _watchdog(self):
+        global last_frame_time
+        while self.running:
+            time.sleep(3)
+            if time.time() - last_frame_time > 3.0:
+                print("\n[경고] 카메라 정지 감지! 강제 재시작...\n")
+                self._cleanup()
+                last_frame_time = time.time()
+
+camera_manager = CameraManager()
+camera_manager.start()
+
+def send_cmd(cmd, v1, v2):
+    if arduino and arduino.is_open:
+        msg = f"<{cmd},{int(v1)},{int(v2)}>"
+        try:
+            arduino.write(msg.encode())
+        except: pass
+
+def generate_frames():
+    while True:
+        with frame_lock:
+            frame_data = global_frame
+        
+        if frame_data:
+            try:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame_data + b'\r\n')
+            except GeneratorExit:
+                 break
+            except Exception as e:
+                 print(f"[전송 오류] {e}")
+                 break
+        else:
+            time.sleep(0.05)
+            continue
+        time.sleep(0.04)
+
+@app.route('/')
+def index():
+    return render_template_string('''
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>Wall-E VR FPV</title>
+        <script src="https://aframe.io/releases/1.4.0/aframe.min.js"></script>
+        <style>body { background-color: #000; }</style>
+      </head>
+      <body>
+        <a-scene loading-screen="dotsColor: white; backgroundColor: black" vr-mode-ui="enterVRButton: #myEnterVRButton">
+          
+          <a-assets>
+            <img id="video-feed" src="/video_feed" crossorigin="anonymous">
+          </a-assets>
+
+          <a-entity id="rig" position="0 1.6 0">
+            <a-entity id="head" camera look-controls head-tracker>
+                <!-- [핵심] FPV 스크린 (HUD) -->
+                <a-plane 
+                    src="#video-feed" 
+                    position="0 0 -1.5" 
+                    width="3.2" 
+                    height="2.4" 
+                    material="shader: flat; side: double"
+                    geometry="primitive: plane">
+                </a-plane>
+            </a-entity>
+            <a-entity oculus-touch-controls="hand: left" drive-controls></a-entity>
+            <a-entity oculus-touch-controls="hand: right" drive-controls></a-entity>
+          </a-entity>
+          <a-sky color="#000"></a-sky>
+          <div id="myEnterVRButton" style="position: absolute; bottom: 20px; right: 20px; z-index: 999;"></div>
+        </a-scene>
+
+        <script>
+          AFRAME.registerComponent('head-tracker', {
+            tick: function () {
+              var rotation = this.el.object3D.rotation;
+              var yaw = THREE.MathUtils.radToDeg(rotation.y);
+              var pitch = THREE.MathUtils.radToDeg(rotation.x);
+              sendSyncData(yaw, pitch);
+            }
+          });
+
+          let joyX = 0, joyY = 0;
+          AFRAME.registerComponent('drive-controls', {
+            tick: function () {
+                const session = this.el.sceneEl.renderer.xr.getSession();
+                if (!session) return;
+                for (const source of session.inputSources) {
+                    if (source.gamepad && source.handedness === 'left') { 
+                        const axes = source.gamepad.axes;
+                        if (axes.length >= 4) {
+                            joyX = axes[2]; 
+                            joyY = axes[3]; 
+                        }
+                    }
+                }
+            }
+          });
+
+          let lastSend = 0;
+          function sendSyncData(yaw, pitch) {
+            const now = Date.now();
+            if (now - lastSend < 100) return; 
+            lastSend = now;
+
+            let pan = 90 + (yaw * 1.0); 
+            let tilt = 90 + (pitch * 1.0); 
+
+            pan = Math.min(Math.max(pan, 0), 180);
+            tilt = Math.min(Math.max(tilt, 30), 150);
+
+            let speed = -joyY * 200; 
+            let turn = joyX * 150;
+            
+            if (Math.abs(speed) < 20) speed = 0;
+            if (Math.abs(turn) < 20) turn = 0;
+
+            let lm = speed + turn;
+            let rm = speed - turn;
+
+            fetch('/sync', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    p: Math.round(pan),
+                    t: Math.round(tilt),
+                    lm: Math.round(lm),
+                    rm: Math.round(rm)
+                })
+            }).catch(e => {});
+          }
+        </script>
+      </body>
+    </html>
+    ''')
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/sync', methods=['POST'])
+def sync():
+    d = request.json
+    send_cmd("HEAD", d['p'], d['t'])
+    send_cmd("MOVE", d['lm'], d['rm'])
+    return jsonify(success=True)
+
+if __name__ == '__main__':
+    ensure_certificates()
+    
+    print("=== [VR FPV 모드 시작] ===")
+    print(f"퀘스트3 접속: https://{HOST_IP}:{PORT}")
+    
+    if not os.path.exists(CERT_FILE) or not os.path.exists(KEY_FILE):
+        sys.exit(1)
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(CERT_FILE, KEY_FILE)
+
+    try:
+        app.run(host='0.0.0.0', port=PORT, threaded=True, ssl_context=context, debug=False, use_reloader=False)
+    finally:
+        camera_manager.stop()
+        print("종료 중...")
