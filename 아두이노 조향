@@ -1,0 +1,126 @@
+#include <Servo.h>
+#include <SoftwareSerial.h>
+
+/**
+ * L298N PWM 기반 블루투스 RC카 통합 제어 코드 (즉시 속도/조향 버전)
+ * 가속 및 감속 보간 로직을 완전히 제거하여 명령 즉시 PWM과 서보가 반응합니다.
+ */
+
+// 모터 방향 제어 핀
+const int LEFT_FORWARD  = 4;  
+const int LEFT_REVERSE  = 7;  
+const int RIGHT_FORWARD = 12; 
+const int RIGHT_REVERSE = 13; 
+
+// PWM 속도 제어 핀 (Timer0 사용 핀)
+const int ENA = 6; 
+const int ENB = 5; 
+
+// 기타 부품 핀
+const int LED_PIN   = 11; 
+const int SERVO_PIN = 8;  
+
+// 주행 설정 값
+const int MAX_SPEED = 250;     // 최대 속도
+const int STEER_LIMIT = 30;    // 중심(100) 기준 좌우 최대 타각
+const int CENTER_ANGLE = 100;  // 서보 중앙 각도
+
+// 가변 상태 변수
+int current_speed = 0;         // 현재 속도 (즉시 반영)
+int target_angle = CENTER_ANGLE;
+char current_dir = 'S';
+
+SoftwareSerial bluetooth(2, 3);
+Servo myservo;
+
+void setup() {
+  pinMode(LEFT_FORWARD, OUTPUT);
+  pinMode(LEFT_REVERSE, OUTPUT);
+  pinMode(RIGHT_FORWARD, OUTPUT);
+  pinMode(RIGHT_REVERSE, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  
+  myservo.attach(SERVO_PIN);
+  myservo.write(CENTER_ANGLE);
+  
+  Serial.begin(9600);
+  bluetooth.begin(9600);
+  
+  Serial.println("System Ready - Instant PWM & Steering Mode");
+}
+
+/**
+ * 하드웨어 실제 구동 적용 함수
+ */
+void updateHardware() {
+  // 방향 제어
+  if (current_dir == 'F') {
+    digitalWrite(LEFT_FORWARD, HIGH);
+    digitalWrite(LEFT_REVERSE, LOW);
+    digitalWrite(RIGHT_FORWARD, HIGH);
+    digitalWrite(RIGHT_REVERSE, LOW);
+  } else if (current_dir == 'B') {
+    digitalWrite(LEFT_FORWARD, LOW);
+    digitalWrite(LEFT_REVERSE, HIGH);
+    digitalWrite(RIGHT_FORWARD, LOW);
+    digitalWrite(RIGHT_REVERSE, HIGH);
+  } else {
+    digitalWrite(LEFT_FORWARD, LOW);
+    digitalWrite(LEFT_REVERSE, LOW);
+    digitalWrite(RIGHT_FORWARD, LOW);
+    digitalWrite(RIGHT_REVERSE, LOW);
+  }
+
+  // PWM 적용: 보간 없이 현재 설정된 속도를 즉시 출력
+  analogWrite(ENA, current_speed);
+  analogWrite(ENB, current_speed);
+
+  // 조향 적용: 목표 각도로 즉시 이동
+  myservo.write(target_angle);
+}
+
+void loop() {
+  char cmd = 0;
+
+  if (bluetooth.available()) {
+    cmd = bluetooth.read();
+  } 
+  else if (Serial.available()) {
+    cmd = Serial.read();
+  }
+
+  if (cmd != 0) {
+    switch (cmd) {
+      case 'F': 
+        current_dir = 'F';
+        current_speed = MAX_SPEED; // 즉시 최대 속도 대입
+        target_angle = CENTER_ANGLE;
+        break;
+      case 'B':
+        current_dir = 'B';
+        current_speed = MAX_SPEED; // 즉시 최대 속도 대입
+        target_angle = CENTER_ANGLE;
+        break;
+      case 'L':
+        current_dir = 'F'; 
+        current_speed = MAX_SPEED; 
+        target_angle = CENTER_ANGLE + STEER_LIMIT; 
+        break;
+      case 'R':
+        current_dir = 'F'; 
+        current_speed = MAX_SPEED;
+        target_angle = CENTER_ANGLE - STEER_LIMIT; 
+        break;
+      case 'S':
+        current_dir = 'S';         // 즉시 정지 상태로 변경
+        current_speed = 0;         // 즉시 속도 0 대입
+        target_angle = CENTER_ANGLE; 
+        break;
+    }
+  }
+
+  updateHardware();
+  delay(10); 
+}
